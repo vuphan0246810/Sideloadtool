@@ -1,0 +1,59 @@
+name: Build APK
+
+# Không có SDK Android / Gradle / máy ảo Android nào trong môi trường Replit
+# dùng để viết dự án này, nên việc build & test thực sự CHỈ có thể chạy ở đây
+# (GitHub Actions) hoặc trên máy của bạn với Android Studio. Workflow này build
+# ra một APK debug (chưa tối ưu/minify) mỗi khi có push/PR, và bạn có thể tải
+# nó về từ tab "Actions" -> chọn lần chạy -> mục "Artifacts" bên dưới.
+#
+# LƯU Ý: workflow này KHÔNG có bước test tự động nào cho lớp USB/usbmux/AFC
+# (mux_usb.py, device_link.py) — không thể mô phỏng một iPhone thật cắm qua
+# USB trong CI. Build thành công chỉ có nghĩa là code biên dịch được, KHÔNG
+# có nghĩa là luồng ghép nối/cài đặt qua USB đã hoạt động trên phần cứng thật.
+# Xem README.md, mục "Rủi ro đã biết".
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platform/build-tools Chaquopy/AGP need
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      # Repo này không commit gradle-wrapper.jar (môi trường viết code - Replit
+      # - không có Java/Gradle để tự tạo wrapper một cách đáng tin cậy).
+      # setup-gradle tự tải về đúng bản Gradle khai báo ở `gradle-version` và
+      # cache lại giữa các lần chạy, nên ta gọi thẳng `gradle` thay vì `./gradlew`.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: superalpha-sideload-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
