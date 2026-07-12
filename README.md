@@ -100,6 +100,26 @@ build/test được trên phần cứng thật ở môi trường viết code n�
   cảnh mặc định của `NavHost` khi đổi giữa 3 tab (Sideload/Thu hồi cert/Cài
   đặt) — đây là điều hướng ngang cấp, animation trượt chỉ tạo cảm giác trễ mà
   không có giá trị điều hướng nào.
+- **Sửa tiếp lỗi "Không claim được interface usbmux" (lặp lại kể cả sau khi đã
+  thử lại nhiều lần):** đây là một lỗi khác, sâu hơn, so với các lỗi USB đã sửa
+  ở trên — không phải lỗi tạm thời mà là ép sai cấu hình (configuration) USB
+  một cách hệ thống. `UsbDevice.getInterface()` của Android gộp chung interface
+  từ TẤT CẢ các cấu hình USB mà thiết bị khai báo, kể cả những cấu hình không
+  phải cấu hình đang thực sự hoạt động trên phần cứng lúc đó; code cũ luôn ép
+  `setConfiguration()` về cấu hình đầu tiên bất kể interface usbmux tìm được
+  thực sự nằm ở cấu hình nào, nên nếu iPhone của bạn khai báo interface usbmux
+  ở một cấu hình khác cấu hình đầu tiên, `claimInterface()` sẽ luôn thất bại —
+  không có số lần thử lại nào sửa được. Đã sửa để dò đúng cấu hình chứa
+  interface usbmux trước, set đúng cấu hình đó, rồi mới claim (xem
+  `UsbTransport.findUsbmuxInterfaceWithConfig`). Đã tham khảo repo
+  [termux-usbmuxd](https://github.com/LLOS-Lord/termux-usbmuxd) mà bạn gửi để
+  đối chiếu — repo đó dùng `termux-usb` (Termux:API) để lấy quyền + file
+  descriptor USB rồi giao cho `usbmuxd` gốc (C, dùng libusb) xử lý phần
+  claim/giao thức, nên bản thân nó không gặp lỗi này (không đi qua đúng đoạn
+  code Java `UsbDevice.getInterface()` có hành vi gộp cấu hình nói trên); đây
+  là gợi ý hữu ích để xác nhận hướng sửa, nhưng dự án này vẫn giữ nguyên cách
+  tiếp cận dùng thẳng `android.hardware.usb` (không qua Termux) như yêu cầu ban
+  đầu của bạn.
 - **Màn "Cài đặt" giờ có chức năng thật** (trước đây chỉ là văn bản tĩnh):
   lưu Apple ID (không lưu mật khẩu — xem lý do trong mã), và cho chọn server
   Anisette: "Tự động" hoặc chọn tay từ danh sách công khai thật lấy từ

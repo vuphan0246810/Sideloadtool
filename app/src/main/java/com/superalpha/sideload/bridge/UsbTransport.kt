@@ -1,5 +1,6 @@
 package com.superalpha.sideload.bridge
 
+import android.hardware.usb.UsbConfiguration
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
@@ -69,14 +70,46 @@ object UsbTransport {
     fun findAppleDevice(usbManager: UsbManager): UsbDevice? =
         usbManager.deviceList.values.firstOrNull { it.vendorId == VENDOR_ID_APPLE }
 
-    fun findUsbmuxInterface(device: UsbDevice): UsbInterface? {
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            if (iface.interfaceClass == INTERFACE_CLASS &&
-                iface.interfaceSubclass == INTERFACE_SUBCLASS &&
-                iface.interfaceProtocol == INTERFACE_PROTOCOL
-            ) {
-                return iface
+    /** Kết quả tìm interface usbmux: interface đó thuộc CẤU HÌNH (configuration)
+     * USB cụ thể nào — xem giải thích chi tiết ở [findUsbmuxInterfaceWithConfig]. */
+    private data class FoundInterface(val config: UsbConfiguration, val iface: UsbInterface)
+
+    /** Giữ lại cho khả năng tương thích ngược / log; KHÔNG dùng kết quả này để
+     * claim trực tiếp nữa — dùng [findUsbmuxInterfaceWithConfig] (xem lý do ở đó). */
+    fun findUsbmuxInterface(device: UsbDevice): UsbInterface? =
+        findUsbmuxInterfaceWithConfig(device)?.iface
+
+    /**
+     * Tìm interface usbmux (class=0xFF sub=0xFE proto=0x02) CÙNG VỚI cấu hình USB
+     * (UsbConfiguration) thực sự chứa nó.
+     *
+     * Đây là chỗ sửa lỗi cốt lõi cho "Không claim được interface usbmux" xảy ra
+     * NGAY CẢ SAU KHI ĐÃ THỬ LẠI NHIỀU LẦN (dấu hiệu cho thấy đây không phải lỗi
+     * tạm thời mà retry có thể tự sửa được): `UsbDevice.getInterface()` gộp
+     * chung danh sách interface từ TẤT CẢ các cấu hình mà thiết bị khai báo, kể
+     * cả những cấu hình KHÔNG PHẢI cấu hình đang thực sự hoạt động trên phần
+     * cứng. iPhone thường khai báo nhiều hơn 1 cấu hình USB (ví dụ một số máy
+     * mặc định enum ở cấu hình "tối giản" trước khi được host chọn cấu hình đầy
+     * đủ có interface usbmux). Code cũ luôn gọi `setConfiguration(getConfiguration(0))`
+     * — tức luôn ép về cấu hình ĐẦU TIÊN — bất kể interface usbmux tìm được thực
+     * sự nằm ở cấu hình nào; nếu nó nằm ở cấu hình khác, `claimInterface()` sẽ
+     * luôn thất bại vì ở tầng kernel, interface đó chưa từng active trên cấu
+     * hình hiện tại của thiết bị. Vì đây không phải lỗi "may rủi theo thời
+     * điểm" mà là ép sai cấu hình một cách hệ thống, không có số lần thử lại
+     * nào sửa được — khớp với việc log của người dùng báo lỗi này liên tục,
+     * ngay cả sau khi UsbTransport đã thử lại 3 lần.
+     */
+    private fun findUsbmuxInterfaceWithConfig(device: UsbDevice): FoundInterface? {
+        for (c in 0 until device.configurationCount) {
+            val config = device.getConfiguration(c)
+            for (i in 0 until config.interfaceCount) {
+                val iface = config.getInterface(i)
+                if (iface.interfaceClass == INTERFACE_CLASS &&
+                    iface.interfaceSubclass == INTERFACE_SUBCLASS &&
+                    iface.interfaceProtocol == INTERFACE_PROTOCOL
+                ) {
+                    return FoundInterface(config, iface)
+                }
             }
         }
         return null
@@ -116,10 +149,11 @@ object UsbTransport {
     private fun openOnce(usbManager: UsbManager, device: UsbDevice): String? {
         close()
 
-        val iface = findUsbmuxInterface(device)
-        if (iface == null) {
+        val found = findUsbmuxInterfaceWithConfig(device)
+        if (found == null) {
             return "Không tìm thấy interface usbmux (class=0xFF sub=0xFE proto=0x02) trên thiết bị."
         }
+        val (targetConfig, iface) = found
 
         var inEp: UsbEndpoint? = null
         var outEp: UsbEndpoint? = null
@@ -139,21 +173,18 @@ object UsbTransport {
                 "hoặc thiết bị vừa được cắm lại — sẽ tự thử lại)."
         }
 
-        // Chọn cấu hình USB trước khi claim interface. Hầu hết thiết bị Android tự
-        // chọn cấu hình mặc định khi mở, nhưng một số driver USB host lại yêu cầu
-        // set cấu hình rõ ràng trước khi claimInterface() thành công — bước này
-        // trước đây hoàn toàn không có, nên bị bỏ qua âm thầm. setConfiguration()
-        // có thể trả false vô hại nếu thiết bị chỉ có 1 cấu hình (đã là mặc định);
-        // không coi đó là lỗi nghiêm trọng, chỉ log cảnh báo.
-        if (device.configurationCount > 0) {
-            try {
-                val configured = conn.setConfiguration(device.getConfiguration(0))
-                if (!configured) {
-                    Log.w(TAG, "setConfiguration() trả false (có thể thiết bị chỉ có 1 cấu hình sẵn có — bỏ qua).")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "setConfiguration() lỗi (bỏ qua, thử claimInterface trực tiếp): $e")
+        // QUAN TRỌNG: phải set ĐÚNG cấu hình chứa interface usbmux tìm được ở trên
+        // (targetConfig), KHÔNG phải luôn luôn cấu hình đầu tiên (getConfiguration(0))
+        // như trước — xem giải thích đầy đủ ở kdoc của findUsbmuxInterfaceWithConfig().
+        // Đây là nguyên nhân gốc thực sự của lỗi "Không claim được interface usbmux"
+        // lặp lại mãi kể cả sau khi đã thử lại nhiều lần.
+        try {
+            val configured = conn.setConfiguration(targetConfig)
+            if (!configured) {
+                Log.w(TAG, "setConfiguration(id=${targetConfig.id}) trả false (có thể thiết bị chỉ có 1 cấu hình sẵn có — bỏ qua, thử claim trực tiếp).")
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "setConfiguration(id=${targetConfig.id}) lỗi (bỏ qua, thử claimInterface trực tiếp): $e")
         }
 
         if (!conn.claimInterface(iface, true)) {
@@ -162,13 +193,25 @@ object UsbTransport {
                 "khác giữ, hoặc cần rút cắm lại cáp USB)."
         }
 
+        // Kích hoạt đúng alternate setting của interface sau khi claim — cần thiết
+        // với các thiết bị khai báo nhiều altsetting cho cùng một interface (không
+        // phải mọi iPhone đều vậy, nhưng gọi luôn cho chắc; lỗi ở đây không nghiêm
+        // trọng bằng lỗi claim nên chỉ log cảnh báo, không fail toàn bộ open()).
+        try {
+            if (!conn.setInterface(iface)) {
+                Log.w(TAG, "setInterface() trả false (thường vô hại nếu interface chỉ có 1 altsetting).")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "setInterface() lỗi (bỏ qua): $e")
+        }
+
         connection = conn
         usbInterface = iface
         endpointIn = inEp
         endpointOut = outEp
         _connected.value = true
         lastError = null
-        Log.i(TAG, "Đã mở kết nối USB tới ${device.deviceName} (maxPacketSize in=${inEp.maxPacketSize} out=${outEp.maxPacketSize}).")
+        Log.i(TAG, "Đã mở kết nối USB tới ${device.deviceName} (config id=${targetConfig.id}, maxPacketSize in=${inEp.maxPacketSize} out=${outEp.maxPacketSize}).")
         return null
     }
 
