@@ -16,7 +16,7 @@ Android làm "máy tính trung gian" nói chuyện với iPhone qua USB.
 ## 1. Kiến trúc
 
 ```
-android-sideload-tool/
+(gốc dự án — chính là thư mục sau khi giải nén zip này)
 ├── app/
 │   ├── build.gradle.kts          # Cấu hình Chaquopy (Python 3.11), pip deps, ABI arm64-v8a
 │   └── src/main/
@@ -41,7 +41,7 @@ android-sideload-tool/
 │           ├── config_manager.py  # Đọc/ghi config.json
 │           └── utils.py           # Giải nén/đóng gói IPA, đọc Info.plist, v.v.
 ├── app/src/main/jniLibs/arm64-v8a/libzsign.so   # Binary zsign (ký lại IPA) — chỉ arm64
-└── .github/workflows/ (ở gốc repo, xem mục 4)
+└── .github/workflows/build-apk.yml   # CI build APK debug (xem mục 4)
 ```
 
 **Luồng dữ liệu chính khi bấm "Ký & Cài đặt":**
@@ -110,8 +110,9 @@ xem đầu tiên — không phải lỗi ở logic ký hay ở Apple Developer A
 ## 3. Build bằng Android Studio (khuyến nghị để tự test/debug)
 
 1. Cài **Android Studio** (bản mới, hỗ trợ AGP 8.6.x trở lên) và **JDK 17**.
-2. Giải nén file zip này ra một thư mục, rồi mở chính thư mục đó bằng Android
-   Studio ("Open" -> chọn thư mục vừa giải nén — thư mục chứa `settings.gradle.kts`).
+2. Giải nén zip này, rồi mở **thư mục vừa giải nén** bằng Android Studio
+   ("Open" -> chọn thư mục đó — đây là gốc dự án, đã chứa sẵn
+   `settings.gradle.kts` ngay bên trong).
 3. Android Studio sẽ tự tải Gradle wrapper (repo không commit sẵn file
    `gradle-wrapper.jar` — môi trường viết code này không có Java/Gradle để
    tạo file đó). Nếu Android Studio không tự tạo wrapper, chạy trong
@@ -137,8 +138,9 @@ Workflow tại **`.github/workflows/build-apk.yml`** (đã có sẵn ở gốc t
 zip này) sẽ tự build APK debug mỗi khi có push/PR. Cách lấy APK:
 
 1. Giải nén zip này, tạo một repository GitHub mới (hoặc dùng repo có sẵn),
-   rồi đẩy (push) toàn bộ nội dung đã giải nén lên đó — sao cho `settings.gradle.kts`
-   và thư mục `.github/` nằm ngay ở gốc repository, không nằm trong thư mục con.
+   rồi đẩy (push) toàn bộ nội dung đã giải nén lên đó — sao cho
+   `settings.gradle.kts` và thư mục `.github/` nằm ngay ở gốc repository,
+   không nằm trong thư mục con.
 2. Vào tab **Actions** trên GitHub -> chọn lần chạy workflow "Build APK" mới
    nhất -> kéo xuống mục **Artifacts** -> tải `superalpha-sideload-debug-apk`.
 3. Cài file APK đó lên điện thoại Android (cần bật "Cài từ nguồn không xác
@@ -147,6 +149,22 @@ zip này) sẽ tự build APK debug mỗi khi có push/PR. Cách lấy APK:
 Vì môi trường CI không có iPhone thật cắm qua USB, workflow này **chỉ xác
 nhận code biên dịch được**, không xác nhận luồng USB/ghép nối/cài đặt hoạt
 động — việc đó cần test thủ công theo mục 2 và 3.
+
+### Lỗi thường gặp: "Couldn't find Python 3.11"
+
+Chaquopy cần chạy `pip` **ngay trên máy build** (không phải trên máy ảo
+Android) để tải các thư viện Python (`requests`, `cryptography`, `srp`), nên
+nó cần tìm được một Python 3.11 thật trên `PATH` của máy build — khớp đúng
+major.minor với `version = "3.11"` khai báo trong `app/build.gradle.kts`.
+Runner `ubuntu-latest` của GitHub Actions không đảm bảo có sẵn Python 3.11
+trên `PATH`, nên workflow có bước **"Set up build Python (3.11, required by
+Chaquopy)"** (dùng `actions/setup-python@v5`) chạy trước bước build — bước
+này **bắt buộc phải có** trước bước "Build debug APK", nếu không Gradle sẽ
+báo lỗi này khi chạy task `:app:installDebugPythonRequirements`. Nếu bạn tự
+build local bằng Android Studio (mục 3) và gặp lỗi tương tự, hãy cài Python
+3.11 trên máy và đảm bảo nó có trên `PATH` (Chaquopy tự tìm bằng lệnh
+`python3.11`, rồi `python3`, rồi `python`; xem
+[tài liệu buildPython](https://chaquo.com/chaquopy/doc/current/android.html#buildpython)).
 
 ---
 
