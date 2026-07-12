@@ -40,6 +40,9 @@ object UsbTransport {
     /** USB_MRU from usbmuxd/src/usb.h — the maximum single read chunk usbmuxd uses. */
     const val USB_MRU = 16384
 
+    private const val MAX_OPEN_ATTEMPTS = 3
+    private const val OPEN_RETRY_DELAY_MS = 200L
+
     @Volatile private var connection: UsbDeviceConnection? = null
     @Volatile private var usbInterface: UsbInterface? = null
     @Volatile private var endpointIn: UsbEndpoint? = null
@@ -47,6 +50,20 @@ object UsbTransport {
 
     private val _connected = MutableStateFlow(false)
     val connected = _connected.asStateFlow()
+
+    /** Lý do thất bại cụ thể của lần gọi [open] gần nhất (một trong 4 nhánh lỗi
+     * bên dưới), hoặc null nếu lần gần nhất thành công/chưa gọi. Trước đây
+     * UsbPermissionManager chỉ báo một câu chung "Mở kết nối USB thất bại." cho
+     * mọi trường hợp — không phân biệt được "không tìm thấy interface" với
+     * "openDevice() trả null" (thường là do hệ thống chưa kịp cấp quyền xong)
+     * với "claimInterface() thất bại" (thường là do một tiến trình/app khác
+     * đang giữ interface, hoặc thiết bị cần mở lại sau khi rút/cắm). Biết chính
+     * xác nhánh nào giúp người dùng (và người debug) biết nên thử lại, rút cắm
+     * lại cáp, hay đó là lỗi thật cần sửa code. */
+    @Volatile private var lastError: String? = null
+
+    @JvmStatic
+    fun lastError(): String? = lastError
 
     /** Finds the first attached Apple device, or null if none is plugged in. */
     fun findAppleDevice(usbManager: UsbManager): UsbDevice? =
@@ -68,16 +85,40 @@ object UsbTransport {
     /**
      * Claims the usbmux interface and finds its bulk IN/OUT endpoints. Must be called
      * after permission has already been granted (see UsbPermissionManager). Returns
-     * true on success.
+     * true on success. On failure, [lastError] holds the specific reason.
+     *
+     * Retries a few times with a short delay: right after a permission grant, or
+     * right after the device re-enumerates, `openDevice`/`claimInterface` can fail
+     * transiently for a brief window before the USB host stack settles — a single
+     * immediate attempt does not give it that chance. Must be called off the main
+     * thread (it may sleep briefly between attempts); see UsbPermissionManager.
      */
     @Synchronized
     fun open(usbManager: UsbManager, device: UsbDevice): Boolean {
+        var attemptError: String? = null
+        for (attempt in 1..MAX_OPEN_ATTEMPTS) {
+            val error = openOnce(usbManager, device)
+            if (error == null) return true
+            attemptError = error
+            Log.w(TAG, "open() lần $attempt/$MAX_OPEN_ATTEMPTS thất bại: $error")
+            if (attempt < MAX_OPEN_ATTEMPTS) {
+                try {
+                    Thread.sleep(OPEN_RETRY_DELAY_MS)
+                } catch (_: InterruptedException) {
+                }
+            }
+        }
+        lastError = attemptError
+        return false
+    }
+
+    /** Một lần thử mở kết nối. Trả về null nếu thành công, hoặc mô tả lỗi cụ thể. */
+    private fun openOnce(usbManager: UsbManager, device: UsbDevice): String? {
         close()
 
         val iface = findUsbmuxInterface(device)
         if (iface == null) {
-            Log.e(TAG, "Không tìm thấy interface usbmux (class=0xFF sub=0xFE proto=0x02) trên thiết bị.")
-            return false
+            return "Không tìm thấy interface usbmux (class=0xFF sub=0xFE proto=0x02) trên thiết bị."
         }
 
         var inEp: UsbEndpoint? = null
@@ -89,19 +130,36 @@ object UsbTransport {
             if (ep.direction == UsbConstants.USB_DIR_OUT) outEp = ep
         }
         if (inEp == null || outEp == null) {
-            Log.e(TAG, "Interface usbmux thiếu bulk endpoint IN/OUT.")
-            return false
+            return "Interface usbmux thiếu bulk endpoint IN/OUT."
         }
 
         val conn = usbManager.openDevice(device)
         if (conn == null) {
-            Log.e(TAG, "usbManager.openDevice() trả về null.")
-            return false
+            return "usbManager.openDevice() trả về null (thường do quyền USB chưa ổn định " +
+                "hoặc thiết bị vừa được cắm lại — sẽ tự thử lại)."
         }
+
+        // Chọn cấu hình USB trước khi claim interface. Hầu hết thiết bị Android tự
+        // chọn cấu hình mặc định khi mở, nhưng một số driver USB host lại yêu cầu
+        // set cấu hình rõ ràng trước khi claimInterface() thành công — bước này
+        // trước đây hoàn toàn không có, nên bị bỏ qua âm thầm. setConfiguration()
+        // có thể trả false vô hại nếu thiết bị chỉ có 1 cấu hình (đã là mặc định);
+        // không coi đó là lỗi nghiêm trọng, chỉ log cảnh báo.
+        if (device.configurationCount > 0) {
+            try {
+                val configured = conn.setConfiguration(device.getConfiguration(0))
+                if (!configured) {
+                    Log.w(TAG, "setConfiguration() trả false (có thể thiết bị chỉ có 1 cấu hình sẵn có — bỏ qua).")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "setConfiguration() lỗi (bỏ qua, thử claimInterface trực tiếp): $e")
+            }
+        }
+
         if (!conn.claimInterface(iface, true)) {
-            Log.e(TAG, "Không claim được interface usbmux.")
             conn.close()
-            return false
+            return "Không claim được interface usbmux (thiết bị có thể đang bị một app/dịch vụ " +
+                "khác giữ, hoặc cần rút cắm lại cáp USB)."
         }
 
         connection = conn
@@ -109,8 +167,9 @@ object UsbTransport {
         endpointIn = inEp
         endpointOut = outEp
         _connected.value = true
+        lastError = null
         Log.i(TAG, "Đã mở kết nối USB tới ${device.deviceName} (maxPacketSize in=${inEp.maxPacketSize} out=${outEp.maxPacketSize}).")
-        return true
+        return null
     }
 
     @Synchronized

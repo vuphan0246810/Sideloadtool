@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 
 from com.superalpha.sideload.bridge import AppPaths, NativeLog, UiPrompt
 
-from apple_auth import AppleAuth
+from apple_auth import AppleAuth, fetch_official_servers
 from developer_api import DeveloperAPI
 from utils import (
     run_command, extract_ipa, find_app_bundle, get_bundle_id, get_app_name,
@@ -68,6 +68,45 @@ def get_cached_udid():
 
 def get_connected_udid():
     return config_manager.get_connected_udid()
+
+
+# ── Cầu nối cho màn "Cài đặt" (SettingsScreen.kt / PythonBridge.kt) ──────────
+# Apple ID được lưu lại để tự điền ở các tab khác; mật khẩu KHÔNG bao giờ đi
+# qua các hàm này (xem ghi chú trong config_manager.get_apple_id).
+
+def get_saved_apple_id() -> str:
+    return config_manager.get_apple_id()
+
+
+def save_apple_id(apple_id: str):
+    config_manager.set_apple_id(apple_id)
+
+
+def get_saved_anisette_url() -> str:
+    return config_manager.get_anisette_url()
+
+
+def save_anisette_url(url: str):
+    config_manager.set_anisette_url(url)
+
+
+def list_anisette_servers() -> str:
+    """Trả về danh sách server Anisette công khai (SideStore) dạng CHUỖI
+    JSON — Kotlin (PythonBridge.kt) parse bằng org.json.JSONArray, thay vì
+    trả một list[dict] Python trực tiếp qua Chaquopy (chuyển đổi kiểu phức
+    tạp hơn và kém rõ ràng hơn một chuỗi JSON đơn giản). Dùng cho dropdown
+    chọn server trong SettingsScreen."""
+    import json
+    try:
+        servers = fetch_official_servers()
+        simplified = [
+            {"name": s.get("name") or "?", "address": s.get("address")}
+            for s in servers if s.get("address")
+        ]
+        return json.dumps(simplified)
+    except Exception as e:
+        print(f"[anisette] Lỗi khi lấy danh sách server cho Cài đặt: {e}")
+        return "[]"
 
 
 def _first_present(d, keys, default=None):

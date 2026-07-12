@@ -49,11 +49,23 @@ fun SideloadScreen(viewModel: HomeViewModel) {
     val logLines by viewModel.log.collectAsState()
     val usbConnected by viewModel.usbConnected.collectAsState()
     val busy by viewModel.busy.collectAsState()
+    val savedAppleId by viewModel.savedAppleId.collectAsState()
+    val savedAnisetteUrl by viewModel.savedAnisetteUrl.collectAsState()
 
     var ipaPath by remember { mutableStateOf<String?>(null) }
     var ipaName by remember { mutableStateOf("Chưa chọn file IPA") }
     var appleId by remember { mutableStateOf("") }
+    var appleIdPrefilled by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
+
+    // Tự điền Apple ID đã lưu trong Cài đặt, một lần duy nhất khi có giá trị
+    // (không đè lên nếu người dùng đã tự gõ gì đó trước khi giá trị lưu tải xong).
+    androidx.compose.runtime.LaunchedEffect(savedAppleId) {
+        if (!appleIdPrefilled && savedAppleId.isNotBlank()) {
+            if (appleId.isBlank()) appleId = savedAppleId
+            appleIdPrefilled = true
+        }
+    }
 
     val pickIpaLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -112,7 +124,10 @@ fun SideloadScreen(viewModel: HomeViewModel) {
                     viewModel.setBusy(true)
                     scope.launch {
                         NativeLog.log("Bắt đầu quá trình ký & cài đặt...")
-                        val outcome = PythonBridge.sideload(path, appleId, password, null, null)
+                        val outcome = PythonBridge.sideload(
+                            path, appleId, password, null,
+                            savedAnisetteUrl.ifBlank { null }
+                        )
                         if (!outcome.success && outcome.message.isNotBlank()) {
                             NativeLog.log("Lỗi: ${outcome.message}")
                         }

@@ -1,5 +1,7 @@
 package com.superalpha.sideload.ui
 
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
@@ -56,7 +58,16 @@ fun AppNavHost(viewModel: HomeViewModel) {
         NavHost(
             navController = navController,
             startDestination = Screen.Sideload.route,
-            modifier = androidx.compose.ui.Modifier.padding(innerPadding)
+            modifier = androidx.compose.ui.Modifier.padding(innerPadding),
+            // Bỏ hoàn toàn animation chuyển màn khi đổi tab dưới cùng: đây là
+            // điều hướng ngang cấp (3 tab chính), không phải push/pop kiểu
+            // "đi sâu vào màn hình con", nên animation trượt mặc định của
+            // Compose Navigation chỉ tạo cảm giác trễ mà không có giá trị điều
+            // hướng nào — chuyển tab giờ đổi nội dung ngay lập tức.
+            enterTransition = { EnterTransition.None },
+            exitTransition = { ExitTransition.None },
+            popEnterTransition = { EnterTransition.None },
+            popExitTransition = { ExitTransition.None }
         ) {
             composable(Screen.Sideload.route) { SideloadScreen(viewModel) }
             composable(Screen.Revoke.route) { RevokeCertsScreen(viewModel) }

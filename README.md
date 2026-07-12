@@ -64,7 +64,52 @@ Android làm "máy tính trung gian" nói chuyện với iPhone qua USB.
 
 ---
 
-## 2. Rủi ro đã biết (đọc trước khi dùng)
+## 2. Đã sửa trong bản này
+
+So với bản trước, các vấn đề sau đã được sửa trực tiếp trong code (không phải
+build/test được trên phần cứng thật ở môi trường viết code này — xem mục
+"Rủi ro đã biết" ngay dưới đây để biết phần nào vẫn cần bạn tự kiểm chứng):
+
+- **Anisette server sai địa chỉ (rất có thể là nguyên nhân đăng nhập/2FA thất
+  bại từ trước tới nay):** `apple_auth.py` trước đây trỏ `OFFICIAL_SERVERS_URL`
+  và `ANISETTE_URL` vào `127.0.0.1:6969` — một server LOCAL không tồn tại trên
+  Android (không giống bản Termux gốc, ứng dụng này không tự chạy anisette
+  server nào). Đã sửa để trỏ đúng vào `https://servers.sidestore.io/servers.json`
+  (danh sách server công khai thật, đã kiểm tra định dạng response) và
+  `https://ani.sidestore.io` (fallback), nên `AppleAuth` giờ có thể thực sự
+  lấy được thông tin xác thực thiết bị cần cho đăng nhập/2FA.
+- **Kết nối USB thất bại lặp lại sau khi đã cấp quyền:** `UsbTransport.open()`
+  giờ chọn cấu hình USB trước khi claim interface, thử lại tối đa 3 lần với
+  khoảng nghỉ ngắn (khắc phục các thất bại tạm thời ngay sau khi vừa được cấp
+  quyền/vừa cắm lại thiết bị), và báo lỗi cụ thể (không tìm thấy interface /
+  thiếu endpoint / `openDevice` trả null / không claim được interface) thay vì
+  một câu chung "Mở kết nối USB thất bại." — cả trong log lẫn để debug.
+  `UsbPermissionManager` cũng chặn việc bấm "Kết nối" nhiều lần liên tục tạo ra
+  nhiều yêu cầu quyền song song (nguyên nhân của các dòng log lặp lại giống
+  nhau bạn có thể đã thấy), và các lệnh mở kết nối USB thật giờ chạy trên luồng
+  nền, không chặn UI. Ứng dụng cũng tự đóng kết nối khi phát hiện thiết bị bị
+  rút (`SuperAlphaApp`), và tự động thử kết nối khi bạn cắm iPhone vào lúc app
+  đang mở sẵn (`MainActivity.onNewIntent`, nhờ intent-filter
+  `USB_DEVICE_ATTACHED` đã có sẵn trong `AndroidManifest.xml` nhưng trước đây
+  không được xử lý).
+- **Cảm giác trễ khi đổi tab dưới cùng:** nguyên nhân chính là `LogConsole`
+  luôn CHẠY ANIMATION cuộn từ đầu tới cuối log (tới 500 dòng) mỗi lần một tab
+  được mount lại — kể cả khi log không có dòng mới. Đã sửa để lần mount đầu
+  tiên nhảy thẳng tới cuối (không animation), chỉ animate khi có dòng log mới
+  thật xuất hiện trong lúc màn hình đang mở. Đồng thời bỏ animation chuyển
+  cảnh mặc định của `NavHost` khi đổi giữa 3 tab (Sideload/Thu hồi cert/Cài
+  đặt) — đây là điều hướng ngang cấp, animation trượt chỉ tạo cảm giác trễ mà
+  không có giá trị điều hướng nào.
+- **Màn "Cài đặt" giờ có chức năng thật** (trước đây chỉ là văn bản tĩnh):
+  lưu Apple ID (không lưu mật khẩu — xem lý do trong mã), và cho chọn server
+  Anisette: "Tự động" hoặc chọn tay từ danh sách công khai thật lấy từ
+  `servers.sidestore.io`, hoặc nhập URL riêng. Lựa chọn này được dùng thật ở
+  tab Sideload và Thu hồi Certificate (trước đây cả hai tab luôn truyền
+  `null`, bỏ qua hoàn toàn phần chọn server dù logic backend đã có sẵn).
+
+---
+
+## 3. Rủi ro đã biết (đọc trước khi dùng)
 
 Dự án này được viết trong môi trường Replit, **không có SDK Android, không
 có Gradle, không có trình giả lập/thiết bị Android, và không có iPhone thật**
@@ -107,7 +152,7 @@ xem đầu tiên — không phải lỗi ở logic ký hay ở Apple Developer A
 
 ---
 
-## 3. Build bằng Android Studio (khuyến nghị để tự test/debug)
+## 4. Build bằng Android Studio (khuyến nghị để tự test/debug)
 
 1. Cài **Android Studio** (bản mới, hỗ trợ AGP 8.6.x trở lên) và **JDK 17**.
 2. Giải nén zip này, rồi mở **thư mục vừa giải nén** bằng Android Studio
@@ -132,7 +177,7 @@ phải cáp sạc thường; hoặc dùng adapter USB OTG + cáp Lightning gốc
 
 ---
 
-## 4. Build tự động qua GitHub Actions (không cần máy có Android Studio)
+## 5. Build tự động qua GitHub Actions (không cần máy có Android Studio)
 
 Workflow tại **`.github/workflows/build-apk.yml`** (đã có sẵn ở gốc thư mục
 zip này) sẽ tự build APK debug mỗi khi có push/PR. Cách lấy APK:
@@ -148,7 +193,7 @@ zip này) sẽ tự build APK debug mỗi khi có push/PR. Cách lấy APK:
 
 Vì môi trường CI không có iPhone thật cắm qua USB, workflow này **chỉ xác
 nhận code biên dịch được**, không xác nhận luồng USB/ghép nối/cài đặt hoạt
-động — việc đó cần test thủ công theo mục 2 và 3.
+động — việc đó cần test thủ công theo mục 3 và 4.
 
 ### Lỗi thường gặp: "Couldn't find Python 3.11"
 
@@ -161,18 +206,19 @@ trên `PATH`, nên workflow có bước **"Set up build Python (3.11, required b
 Chaquopy)"** (dùng `actions/setup-python@v5`) chạy trước bước build — bước
 này **bắt buộc phải có** trước bước "Build debug APK", nếu không Gradle sẽ
 báo lỗi này khi chạy task `:app:installDebugPythonRequirements`. Nếu bạn tự
-build local bằng Android Studio (mục 3) và gặp lỗi tương tự, hãy cài Python
+build local bằng Android Studio (mục 4) và gặp lỗi tương tự, hãy cài Python
 3.11 trên máy và đảm bảo nó có trên `PATH` (Chaquopy tự tìm bằng lệnh
 `python3.11`, rồi `python3`, rồi `python`; xem
 [tài liệu buildPython](https://chaquo.com/chaquopy/doc/current/android.html#buildpython)).
 
 ---
 
-## 5. Sử dụng ứng dụng
+## 6. Sử dụng ứng dụng
 
 1. Mở app, vào tab **Sideload**.
 2. Cắm iPhone/iPad vào điện thoại Android qua cáp USB (xem lưu ý phần cứng ở
-   mục 3), bấm **Kết nối** — Android sẽ hỏi quyền truy cập USB, chọn "Cho
+   mục 4). Nếu app đang mở sẵn, việc cắm dây giờ tự động thử kết nối luôn;
+   nếu chưa, bấm **Kết nối** — Android sẽ hỏi quyền truy cập USB, chọn "Cho
    phép" (và có thể tick "luôn dùng cho thiết bị này" để không phải hỏi lại).
 3. Bấm **Chọn file IPA**, chọn file `.ipa` cần cài.
 4. Nhập **Apple ID** và **mật khẩu**. Nếu tài khoản bật xác thực 2 yếu tố,
@@ -202,7 +248,7 @@ build local bằng Android Studio (mục 3) và gặp lỗi tương tự, hãy c
 
 ---
 
-## 6. Lưu ý pháp lý / đạo đức
+## 7. Lưu ý pháp lý / đạo đức
 
 Công cụ này chỉ nên dùng để **cài ứng dụng lên chính thiết bị của bạn, bằng
 chính Apple ID của bạn** (sideload cá nhân, không phân phối lại app đã ký cho

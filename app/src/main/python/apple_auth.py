@@ -34,8 +34,33 @@ import traceback
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-ANISETTE_URL = "http://127.0.0.1:6969"
-OFFICIAL_SERVERS_URL = "https://127.0.0.1:6969"
+
+# Sửa lỗi quan trọng: bản gốc để hai hằng số này trỏ vào 127.0.0.1:6969 (một
+# server anisette LOCAL — bản Termux gốc có thể tự chạy một server như vậy
+# trên máy, nhưng ứng dụng Android này không đóng gói/chạy server đó). Kết
+# quả là get_best_anisette_server() không bao giờ lấy được danh sách server
+# thật, và fallback cuối cùng cũng trỏ vào một địa chỉ không tồn tại trên
+# Android -> xác thực Apple ID/2FA luôn thất bại từ bước lấy anisette,
+# bất kể lớp USB có hoạt động hay không. Giá trị đúng:
+ANISETTE_URL = "https://ani.sidestore.io"
+OFFICIAL_SERVERS_URL = "https://servers.sidestore.io/servers.json"
+
+
+def fetch_official_servers():
+    """Lấy danh sách server Anisette công khai từ SideStore, dạng
+    list[dict(name=str, address=str, ...)]. Trả về [] nếu không lấy được
+    (mất mạng, server đổi định dạng, v.v.) — KHÔNG raise, để lời gọi từ màn
+    Cài đặt (qua sideload_core.list_anisette_servers) luôn có giá trị dùng
+    được. Tách riêng khỏi get_best_anisette_server() để màn Cài đặt có thể
+    hiện danh sách đầy đủ (kể cả server không phản hồi lúc đó) cho người
+    dùng tự chọn, không chỉ server "tốt nhất" lúc kiểm tra."""
+    try:
+        resp = requests.get(OFFICIAL_SERVERS_URL, timeout=10, verify=False)
+        resp.raise_for_status()
+        return resp.json().get("servers", [])
+    except Exception as e:
+        print(f"[anisette] Không thể lấy danh sách server: {e}")
+        return []
 
 
 class AppleAuth:
@@ -60,20 +85,18 @@ class AppleAuth:
     def get_best_anisette_server(self):
         """Lấy server Anisette hoạt động tốt nhất từ danh sách SideStore."""
         print("[anisette] Đang tìm kiếm server hoạt động...")
-        try:
-            resp = requests.get(OFFICIAL_SERVERS_URL, timeout=10, verify=False)
-            servers = resp.json().get("servers", [])
-            for server in servers:
-                addr = server.get("address")
-                try:
-                    test_resp = requests.get(addr, timeout=3, verify=False)
-                    if test_resp.ok:
-                        print(f"[anisette] Sử dụng server: {server.get('name')} ({addr})")
-                        return addr
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"[anisette] Không thể lấy danh sách server: {e}")
+        servers = fetch_official_servers()
+        for server in servers:
+            addr = server.get("address")
+            if not addr:
+                continue
+            try:
+                test_resp = requests.get(addr, timeout=3, verify=False)
+                if test_resp.ok:
+                    print(f"[anisette] Sử dụng server: {server.get('name')} ({addr})")
+                    return addr
+            except Exception:
+                continue
 
         print(f"[anisette] Quay lại server mặc định: {ANISETTE_URL}")
         return ANISETTE_URL

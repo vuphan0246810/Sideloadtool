@@ -38,6 +38,41 @@ def save_config(config):
         json.dump(config, f, indent=4)
 
 
+def get_apple_id() -> str:
+    """Apple ID đã lưu từ màn Cài đặt, hoặc chuỗi rỗng nếu chưa có. CHỦ Ý
+    KHÔNG có get_apple_password()/set_apple_password() tương ứng — mật khẩu
+    Apple ID không được lưu ở đâu cả (không ghi ra config.json, không giữ
+    trong bộ nhớ lâu hơn một lần đăng nhập), vì đây là dữ liệu nhạy cảm và
+    người dùng vẫn có thể tự lưu bằng trình quản lý mật khẩu hệ thống nếu
+    muốn — app không nên tự làm điều đó bằng plaintext JSON."""
+    return load_config().get("apple_id", "")
+
+
+def set_apple_id(apple_id: str):
+    config = load_config()
+    if apple_id:
+        config["apple_id"] = apple_id
+    else:
+        config.pop("apple_id", None)
+    save_config(config)
+
+
+def get_anisette_url() -> str:
+    """URL server Anisette người dùng đã chọn thủ công trong Cài đặt, hoặc
+    chuỗi rỗng nếu để "Tự động" (auth.py sẽ tự dò server qua
+    get_best_anisette_server() trong trường hợp đó)."""
+    return load_config().get("anisette_url", "")
+
+
+def set_anisette_url(url: str):
+    config = load_config()
+    if url:
+        config["anisette_url"] = url
+    else:
+        config.pop("anisette_url", None)
+    save_config(config)
+
+
 def get_connected_udid():
     """Trả về UDID của iPhone/iPad đang cắm qua USB, hoặc None nếu không có
     thiết bị nào / không đọc được serial. Xem device_link.get_udid_from_usb()

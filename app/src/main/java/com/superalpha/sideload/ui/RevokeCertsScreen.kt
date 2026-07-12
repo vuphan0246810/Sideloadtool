@@ -38,10 +38,20 @@ fun RevokeCertsScreen(viewModel: HomeViewModel) {
     val scope = rememberCoroutineScope()
     val logLines by viewModel.log.collectAsState()
     val busy by viewModel.busy.collectAsState()
+    val savedAppleId by viewModel.savedAppleId.collectAsState()
+    val savedAnisetteUrl by viewModel.savedAnisetteUrl.collectAsState()
 
     var appleId by remember { mutableStateOf("") }
+    var appleIdPrefilled by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
     var certSelector by remember { mutableStateOf("all") }
+
+    androidx.compose.runtime.LaunchedEffect(savedAppleId) {
+        if (!appleIdPrefilled && savedAppleId.isNotBlank()) {
+            if (appleId.isBlank()) appleId = savedAppleId
+            appleIdPrefilled = true
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("Thu hồi chứng chỉ ký (certificate)", style = MaterialTheme.typography.titleLarge)
@@ -76,7 +86,9 @@ fun RevokeCertsScreen(viewModel: HomeViewModel) {
                     viewModel.setBusy(true)
                     scope.launch {
                         NativeLog.log("Đang đăng nhập & tra cứu chứng chỉ...")
-                        val outcome = PythonBridge.revokeCerts(appleId, password, null, certSelector)
+                        val outcome = PythonBridge.revokeCerts(
+                            appleId, password, savedAnisetteUrl.ifBlank { null }, certSelector
+                        )
                         if (!outcome.success && outcome.message.isNotBlank()) {
                             NativeLog.log("Lỗi: ${outcome.message}")
                         }

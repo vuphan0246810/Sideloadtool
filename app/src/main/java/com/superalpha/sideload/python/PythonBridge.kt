@@ -50,4 +50,55 @@ object PythonBridge {
             null
         }
     }
+
+    data class AnisetteServer(val name: String, val address: String)
+
+    /** Apple ID đã lưu trong Cài đặt, hoặc "" nếu chưa lưu. Không có hàm tương
+     * ứng cho mật khẩu — mật khẩu Apple ID không được lưu ở đâu cả. */
+    suspend fun getSavedAppleId(): String = withContext(Dispatchers.IO) {
+        try {
+            core().callAttr("get_saved_apple_id").toString()
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    suspend fun saveAppleId(appleId: String) = withContext(Dispatchers.IO) {
+        try {
+            core().callAttr("save_apple_id", appleId)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** URL server Anisette đã chọn thủ công, hoặc "" nếu đang ở chế độ "Tự động". */
+    suspend fun getSavedAnisetteUrl(): String = withContext(Dispatchers.IO) {
+        try {
+            core().callAttr("get_saved_anisette_url").toString()
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    suspend fun saveAnisetteUrl(url: String) = withContext(Dispatchers.IO) {
+        try {
+            core().callAttr("save_anisette_url", url)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Danh sách server Anisette công khai (servers.sidestore.io), cho dropdown
+     * chọn server trong Cài đặt. Trả về danh sách rỗng nếu không lấy được
+     * (mất mạng, v.v.) — người dùng vẫn có thể dùng "Tự động" hoặc nhập tay. */
+    suspend fun listAnisetteServers(): List<AnisetteServer> = withContext(Dispatchers.IO) {
+        try {
+            val json = core().callAttr("list_anisette_servers").toString()
+            val arr = org.json.JSONArray(json)
+            (0 until arr.length()).map { i ->
+                val obj = arr.getJSONObject(i)
+                AnisetteServer(obj.optString("name", "?"), obj.optString("address", ""))
+            }.filter { it.address.isNotBlank() }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
 }
