@@ -237,8 +237,19 @@ def _generate_host_identity(device_public_key_pem: bytes, device_version: str | 
             )
         return cert_or_key.public_bytes(serialization.Encoding.PEM)
 
+    def der(cert):
+        """DER (binary) — lockdownd kỳ vọng format này trong PairRecord.
+        PEM text (-----BEGIN CERTIFICATE-----) bị lockdownd từ chối im lặng,
+        Trust popup không xuất hiện trên iPhone (lỗi gốc)."""
+        return cert.public_bytes(serialization.Encoding.DER)
+
     return {
         "root_key_pem": pem(root_key, is_key=True),
+        # DER bytes dùng trong PairRecord gửi lên thiết bị
+        "root_cert_der": der(root_cert),
+        "host_cert_der": der(host_cert),
+        "device_cert_der": der(device_cert),
+        # PEM bytes dùng trong ssl.SSLContext (start_session_tls)
         "root_cert_pem": pem(root_cert),
         "host_key_pem": pem(host_key, is_key=True),
         "host_cert_pem": pem(host_cert),
@@ -281,6 +292,7 @@ def pair_device(udid: str) -> dict:
         host_id = str(uuid.uuid4()).upper()
         system_buid = str(uuid.uuid4()).upper()
 
+        # pair_record lưu về đĩa — PEM để ssl.SSLContext (start_session_tls) load được
         pair_record = {
             "PairRecordID": host_id,
             "HostID": host_id,
@@ -292,13 +304,17 @@ def pair_device(udid: str) -> dict:
             "HostPrivateKey": identity["host_key_pem"],
         }
 
+        # PairRecord gửi lên thiết bị PHẢI dùng DER (binary), KHÔNG dùng PEM.
+        # lockdownd parse DER certificate natively — PEM text (ASCII với header
+        # -----BEGIN CERTIFICATE-----) bị từ chối im lặng, Trust popup sẽ không
+        # xuất hiện trên iPhone (đây là lỗi gốc gây "không thấy popup Trust").
         request = {
             "Request": "Pair",
             "Label": "SuperAlphaSideload",
             "PairRecord": {
-                "DeviceCertificate": identity["device_cert_pem"],
-                "HostCertificate": identity["host_cert_pem"],
-                "RootCertificate": identity["root_cert_pem"],
+                "DeviceCertificate": identity["device_cert_der"],
+                "HostCertificate": identity["host_cert_der"],
+                "RootCertificate": identity["root_cert_der"],
                 "HostID": host_id,
                 "SystemBUID": system_buid,
             },
@@ -306,10 +322,45 @@ def pair_device(udid: str) -> dict:
             "PairingOptions": {"ExtendedPairingErrors": True},
         }
 
-        print("[pairing] Đang gửi yêu cầu ghép nối — kiểm tra màn hình iPhone và bấm 'Trust' (Tin cậy) nếu được hỏi...")
-        response = lockdown._request(request)
-        if response.get("Result") != "Success" and "EscrowBag" not in response:
-            raise LockdownError(f"Pairing thất bại hoặc bị từ chối trên thiết bị: {response}")
+        print("[pairing] Đang gửi yêu cầu ghép nối...")
+        print("[pairing] *** Kiểm tra màn hình iPhone — bấm 'Tin cậy' (Trust This Computer) ***")
+
+        # Gửi trực tiếp (không qua _request()) để kiểm soát timeout riêng
+        _send_plist(lockdown.conn, request)
+
+        # iOS 13+ đôi khi trả PairingDialogResponsePending trước khi hiện dialog.
+        # Timeout 60s vì người dùng cần thời gian đọc + bấm Trust (15s không đủ).
+        MAX_PENDING = 12
+        PENDING_WAIT = 5.0
+        response = None
+        for attempt in range(MAX_PENDING):
+            try:
+                response = _recv_plist(lockdown.conn, timeout=60.0)
+            except Exception as exc:
+                raise LockdownError(
+                    f"Timeout 60s chờ phản hồi Pair: {exc}\n"
+                    "Đảm bảo iPhone không bị khoá màn hình và hãy bấm Trust khi được hỏi."
+                )
+            err = response.get("Error", "")
+            if err == "PairingDialogResponsePending":
+                if attempt == 0:
+                    print("[pairing] Thiết bị đang hiện hộp thoại Trust — đang chờ bạn bấm...")
+                time.sleep(PENDING_WAIT)
+                _send_plist(lockdown.conn, request)
+                continue
+            elif err == "UserDeniedPairing":
+                raise LockdownError(
+                    "Bạn đã bấm 'Không tin cậy' (Don\'t Trust) trên iPhone.\n"
+                    "Ngắt và cắm lại USB, rồi bấm 'Ký & Cài đặt' lại — lần này hãy bấm 'Tin cậy' (Trust)."
+                )
+            elif err == "InvalidHostID":
+                raise LockdownError(
+                    "Thiết bị báo InvalidHostID. Xoá file pair record cũ và thử lại."
+                )
+            break
+
+        if response is None or (response.get("Result") != "Success" and "EscrowBag" not in response):
+            raise LockdownError(f"Pairing thất bại hoặc bị từ chối: {response}")
 
         pair_record["EscrowBag"] = response.get("EscrowBag")
         if wifi_mac_address:

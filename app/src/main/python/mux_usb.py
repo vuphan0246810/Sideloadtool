@@ -151,7 +151,7 @@ class MuxConnection:
         self.device = device
         self.src_port = src_port
         self.dst_port = dst_port
-        self.seq = 1
+        self.seq = 0  # ISN=0 — khớp usbmuxd (tx_seq bắt đầu từ 0)
         self.ack = 0
         self.peer_window = DEFAULT_WINDOW
         self._rx_queue: "queue.Queue[bytes]" = queue.Queue()
@@ -207,6 +207,7 @@ class MuxConnection:
         if not self._closed.is_set():
             try:
                 self.device._send_tcp(self, TCP_FLAG_FIN | TCP_FLAG_ACK, payload=b"")
+                self.seq += 1  # FIN cũng chiếm 1 seq
             except Exception:
                 pass
         self._closed.set()
@@ -357,6 +358,7 @@ class MuxDevice:
         conn = MuxConnection(self, src_port, dst_port)
         self._connections[src_port] = conn
         self._send_tcp(conn, TCP_FLAG_SYN, payload=b"")
+        conn.seq += 1  # SYN chiếm 1 seq — data đầu tiên phải dùng seq=1
         conn.wait_connected(timeout=timeout)
         return conn
 

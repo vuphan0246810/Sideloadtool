@@ -655,7 +655,9 @@ def do_sideload(ipa_path: str, apple_id: str, password: str, udid_override: str 
         # AppPaths.kt.
         run_command(zsign_cmd, extra_env={"LD_LIBRARY_PATH": AppPaths.nativeDepsDir()})
 
-        print("\n[Bước 5/6] Ghép nối với thiết bị (nếu chưa) — kiểm tra màn hình iPhone...")
+        print("\n[Bước 5/6] Ghép nối với thiết bị (nếu chưa)...")
+        print("[pairing] Khi popup xuất hiện trên iPhone, hãy bấm 'Tin cậy' (Trust This Computer).")
+        print("[pairing] Bạn có tối đa 60 giây để bấm Trust sau khi popup xuất hiện.")
         pair_record = _get_or_create_pair_record(udid)
 
         print("\n[Bước 6/6] Đẩy IPA lên thiết bị và cài đặt...")
