@@ -122,42 +122,110 @@ class LockdownClient:
 # hỏi lần đầu — hành vi này giống hệt khi cắm iPhone vào máy Mac/PC lần đầu.
 # ─────────────────────────────────────────────────────────────────────────
 
-def _generate_host_identity():
-    """Sinh bộ chứng chỉ tự ký Host + Root dùng cho pairing, tương đương
-    cách libimobiledevice/usbmuxd tự sinh và lưu trong lockdown/*.plist trên
-    desktop. Không cần CA thật — thiết bị chỉ lưu lại public cert này để xác
-    thực các phiên sau, không xác minh với bên thứ ba nào."""
+def _select_hash_algorithm(device_version: str | None):
+    """Chọn thuật toán băm để ký chuỗi chứng chỉ pairing — khớp hành vi thật
+    của lockdownd/idevicepair: SHA-1 cho thiết bị iOS < 4.0.0 (rất hiếm gặp
+    ngày nay), SHA-256 cho mọi phiên bản còn lại. Xem
+    common/userpref.c::pair_record_generate_keys_and_certs trong
+    libimobiledevice."""
+    from cryptography.hazmat.primitives import hashes
+
+    if not device_version:
+        return hashes.SHA256()
+    try:
+        parts = tuple(int(x) for x in device_version.split("."))
+    except (ValueError, AttributeError):
+        return hashes.SHA256()
+    return hashes.SHA1() if parts < (4, 0, 0) else hashes.SHA256()
+
+
+def _generate_host_identity(device_public_key_pem: bytes, device_version: str | None = None):
+    """Sinh chuỗi chứng chỉ Root CA (tự ký) -> Host cert -> **Device cert**
+    dùng cho pairing, khớp CHÍNH XÁC cấu trúc mà lockdownd thật kỳ vọng
+    (đối chiếu trực tiếp với common/userpref.c của libimobiledevice và với
+    pymobiledevice3/ca.py — hai cách triển khai độc lập, cùng logic):
+
+      - Root CA: subject/issuer RỖNG (x509.Name([])), serial=1, tự ký,
+        BasicConstraints CA:TRUE (critical).
+      - Host cert (lá): subject rỗng, issuer = root, public key = khóa Host
+        do MÁY NÀY sinh ra, ký bởi khóa Root — dùng làm client cert khi
+        nâng cấp TLS ở start_session_tls().
+      - Device cert (lá) — TRƯỚC ĐÂY BỊ THIẾU HOÀN TOÀN trong bản cũ: subject
+        rỗng, issuer = root, public key = **public key của CHÍNH THIẾT BỊ**
+        (nhận được từ lockdownd qua GetValue DevicePublicKey), ký bởi khóa
+        Root. Đây là "DeviceCertificate" mà request Pair phải gửi lại cho
+        thiết bị — thiết bị dùng nó để xác nhận rằng host đã nhận đúng public
+        key của mình. Gửi thẳng DevicePublicKey thô (như bản cũ) thay vì
+        DeviceCertificate đã ký khiến trường bắt buộc "DeviceCertificate" bị
+        thiếu trong PairRecord, nhiều khả năng khiến lockdownd từ chối yêu
+        cầu Pair trước khi kịp hiện hộp thoại "Trust" trên iPhone.
+    """
     from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
     import datetime
 
+    alg = _select_hash_algorithm(device_version)
+    empty_name = x509.Name([])
+    not_before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)
+    not_after = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
+
+    key_usage = x509.KeyUsage(
+        digital_signature=True,
+        key_encipherment=True,
+        key_cert_sign=False,
+        crl_sign=False,
+        content_commitment=False,
+        data_encipherment=False,
+        key_agreement=False,
+        encipher_only=False,
+        decipher_only=False,
+    )
+
     root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Root Certificate")])
     root_cert = (
         x509.CertificateBuilder()
-        .subject_name(root_name)
-        .issuer_name(root_name)
+        .subject_name(empty_name)
+        .issuer_name(empty_name)
         .public_key(root_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+        .serial_number(1)
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(root_key, hashes.SHA256())
+        .sign(root_key, alg)
     )
 
     host_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    host_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Host Certificate")])
     host_cert = (
         x509.CertificateBuilder()
-        .subject_name(host_name)
-        .issuer_name(root_name)
+        .subject_name(empty_name)
+        .issuer_name(root_cert.subject)
         .public_key(host_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
-        .sign(root_key, hashes.SHA256())
+        .serial_number(1)
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(key_usage, critical=True)
+        .sign(root_key, alg)
+    )
+
+    device_public_key = load_pem_public_key(device_public_key_pem)
+    if not isinstance(device_public_key, RSAPublicKey):
+        raise LockdownError("DevicePublicKey trả về từ thiết bị không phải khóa RSA hợp lệ.")
+    device_cert = (
+        x509.CertificateBuilder()
+        .subject_name(empty_name)
+        .issuer_name(root_cert.subject)
+        .public_key(device_public_key)
+        .serial_number(1)
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(key_usage, critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(device_public_key), critical=False)
+        .sign(root_key, alg)
     )
 
     def pem(cert_or_key, is_key=False):
@@ -174,6 +242,7 @@ def _generate_host_identity():
         "root_cert_pem": pem(root_cert),
         "host_key_pem": pem(host_key, is_key=True),
         "host_cert_pem": pem(host_cert),
+        "device_cert_pem": pem(device_cert),
     }
 
 
@@ -181,13 +250,33 @@ def pair_device(udid: str) -> dict:
     """Thực hiện pairing lần đầu với thiết bị. Trả về "pair record" (dict)
     cần lưu lại và truyền cho start_session() ở các lần sau. Thiết bị sẽ
     hiện hộp thoại "Trust This Computer?" — cần người dùng bấm Trust rồi
-    tool mới nhận được phản hồi thành công."""
-    identity = _generate_host_identity()
+    tool mới nhận được phản hồi thành công.
+
+    PairRecord gửi đi khớp CHÍNH XÁC 5 khóa mà lockdownd_pair_record_to_plist()
+    (libimobiledevice src/lockdown.c) tạo ra: DeviceCertificate,
+    HostCertificate, HostID, RootCertificate, SystemBUID — không có
+    DevicePublicKey (bản cũ gửi sai khóa này), không có private key nào."""
     lockdown = LockdownClient()
     try:
         device_public_key_response = lockdown.get_value(key="DevicePublicKey")
         if not device_public_key_response:
             raise LockdownError("Không lấy được DevicePublicKey — thiết bị có thể yêu cầu pairing khác quy trình chuẩn.")
+
+        device_version = None
+        try:
+            device_version = lockdown.get_value(key="ProductVersion")
+        except Exception:
+            pass  # không bắt buộc — chỉ ảnh hưởng lựa chọn SHA-1 và cho iOS rất cũ
+
+        # Lấy WiFiAddress TRƯỚC khi gửi Pair — lấy sau khi Pair xong khiến
+        # iOS 7 tự ngắt kết nối (ghi chú y hệt trong lockdownd_do_pair()).
+        wifi_mac_address = None
+        try:
+            wifi_mac_address = lockdown.get_value(key="WiFiAddress")
+        except Exception:
+            pass
+
+        identity = _generate_host_identity(device_public_key_response, device_version)
 
         host_id = str(uuid.uuid4()).upper()
         system_buid = str(uuid.uuid4()).upper()
@@ -196,6 +285,7 @@ def pair_device(udid: str) -> dict:
             "PairRecordID": host_id,
             "HostID": host_id,
             "SystemBUID": system_buid,
+            "DeviceCertificate": identity["device_cert_pem"],
             "HostCertificate": identity["host_cert_pem"],
             "RootCertificate": identity["root_cert_pem"],
             "RootPrivateKey": identity["root_key_pem"],
@@ -206,7 +296,7 @@ def pair_device(udid: str) -> dict:
             "Request": "Pair",
             "Label": "SuperAlphaSideload",
             "PairRecord": {
-                "DevicePublicKey": device_public_key_response,
+                "DeviceCertificate": identity["device_cert_pem"],
                 "HostCertificate": identity["host_cert_pem"],
                 "RootCertificate": identity["root_cert_pem"],
                 "HostID": host_id,
@@ -221,9 +311,9 @@ def pair_device(udid: str) -> dict:
         if response.get("Result") != "Success" and "EscrowBag" not in response:
             raise LockdownError(f"Pairing thất bại hoặc bị từ chối trên thiết bị: {response}")
 
-        pair_record["DevicePublicKey"] = device_public_key_response
         pair_record["EscrowBag"] = response.get("EscrowBag")
-        pair_record["WiFiMACAddress"] = response.get("WiFiMACAddress")
+        if wifi_mac_address:
+            pair_record["WiFiMACAddress"] = wifi_mac_address
         print("[pairing] ✅ Ghép nối thành công.")
         return pair_record
     finally:
@@ -260,10 +350,26 @@ class TlsLockdownClient:
             self._wrap_tls(pair_record)
 
     def _wrap_tls(self, pair_record):
+        # lockdownd trên iPhone dùng một stack TLS rất cũ/tuỳ biến (nhóm
+        # Diffie-Hellman yếu, không có các phần mở rộng hiện đại). OpenSSL
+        # 3.x mặc định áp @SECLEVEL=2, sẽ từ chối handshake này thẳng thừng
+        # (lỗi điển hình: "dh key too small" / "sslv3 alert handshake
+        # failure" / "certificate verify failed"). Đây là vấn đề tương thích
+        # đã biết rộng rãi khi nói chuyện với lockdownd bằng OpenSSL hiện đại
+        # (không phải lỗi ở logic pairing) — pymobiledevice3 xử lý bằng cách
+        # hạ @SECLEVEL=0 và bật lại cờ legacy renegotiation, áp dụng y hệt ở
+        # đây. Thiếu đoạn này thì dù toàn bộ phần pairing ở trên đúng 100%,
+        # bước nâng cấp TLS vẫn sẽ luôn thất bại trên phần cứng thật.
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        ctx.minimum_version = ssl.TLSVersion.TLSv1
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+        if ssl.OPENSSL_VERSION.lower().startswith("openssl"):
+            ctx.set_ciphers("ALL:!aNULL:!eNULL:@SECLEVEL=0")
+        else:
+            ctx.set_ciphers("ALL:!aNULL:!eNULL")
+        ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
 
         import tempfile, os
         with tempfile.TemporaryDirectory() as tmp:

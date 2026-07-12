@@ -215,6 +215,58 @@ build/test được trên phần cứng thật ở môi trường viết code n�
   khảo, không phải xác nhận bằng bắt gói tin thật; nhiều khả năng vẫn còn
   vấn đề ở tầng pairing/TLS (`device_link.py`) hoặc AFC sau khi bắt tay mux
   hoạt động đúng.
+- **2 lỗi tiếp theo trong tầng pairing/TLS (`device_link.py`), tìm ra sau khi
+  đối chiếu chéo 3 nguồn: mã nguồn thật `libimobiledevice`
+  (`src/lockdown.c`, `common/userpref.c`), repo tham khảo
+  [termux-usbmuxd](https://github.com/LLOS-Lord/termux-usbmuxd) (dùng để xác
+  nhận đây không phải vấn đề kiến trúc — repo đó không tự viết lại giao thức
+  lockdown, mà bọc thẳng `usbmuxd`/`libimobiledevice` gốc), và một bản triển
+  khai lại giao thức lockdown bằng Python độc lập, đã được cộng đồng dùng
+  rộng rãi trên nhiều hệ điều hành
+  ([pymobiledevice3](https://github.com/doronz88/pymobiledevice3)) để xác
+  nhận cách diễn giải tài liệu là đúng:**
+  1. **Thiếu hoàn toàn bước tạo "DeviceCertificate" — rất có thể khiến
+     lockdownd từ chối yêu cầu Pair ngay cả khi mux đã hoạt động đúng, trước
+     khi kịp hiện hộp thoại "Trust This Computer?":** `PairRecord` gửi lên
+     thiết bị **phải** chứa 5 khóa đúng tên
+     `DeviceCertificate`/`HostCertificate`/`HostID`/`RootCertificate`/
+     `SystemBUID` (xem `lockdownd_pair_record_to_plist()` trong
+     `src/lockdown.c`). `DeviceCertificate` không phải là public key thô của
+     thiết bị, mà là một **chứng chỉ X.509 mới**, chứa public key của thiết
+     bị, do máy Android tự ký bằng khóa Root CA mà chính nó vừa sinh ra (xem
+     `pair_record_generate_keys_and_certs()` trong `common/userpref.c`).
+     Bản trước bỏ qua hoàn toàn bước ký này — gửi thẳng
+     `"DevicePublicKey": <public key thô>` vào PairRecord, tức là trường bắt
+     buộc `DeviceCertificate` **luôn bị thiếu** trong mọi yêu cầu Pair. Đã
+     sửa: `_generate_host_identity()` giờ nhận public key thô của thiết bị,
+     tự tạo chuỗi chứng chỉ Root CA (tự ký) -> Host cert -> Device cert (cả
+     hai cert lá đều ký bởi Root CA, đúng cấu trúc `subject`/`issuer` rỗng,
+     `BasicConstraints`/`KeyUsage`, và chọn SHA-1 thay vì SHA-256 khi
+     `ProductVersion` thiết bị < 4.0.0 — khớp logic thật của
+     `idevicepair`/`lockdownd`), rồi gửi đúng `DeviceCertificate` đã ký lên
+     thiết bị.
+  2. **Nâng cấp TLS (`start_session_tls`/`TlsLockdownClient._wrap_tls`) gần
+     như chắc chắn thất bại trên OpenSSL hiện đại, dù mọi thứ ở tầng pairing
+     đều đúng:** lockdownd trên iPhone dùng một stack TLS rất cũ (nhóm
+     Diffie-Hellman yếu, thiếu các phần mở rộng hiện đại). Từ OpenSSL 3.x,
+     mức bảo mật mặc định (`@SECLEVEL=2`) sẽ từ chối thẳng handshake kiểu
+     này với các lỗi khó hiểu như `dh key too small`,
+     `sslv3 alert handshake failure`, hoặc `certificate verify failed` — đây
+     là vấn đề tương thích đã được biết đến rộng rãi khi nói chuyện với
+     lockdownd bằng thư viện TLS hiện đại (không phải lỗi logic pairing/cert
+     ở trên), và là lý do `pymobiledevice3` phải tự hạ `@SECLEVEL=0` và bật
+     lại cờ legacy renegotiation (`SSL_OP_LEGACY_SERVER_CONNECT`) một cách
+     tường minh thay vì dùng cấu hình `ssl.SSLContext` mặc định. Bản trước
+     dùng `ssl.SSLContext` mặc định (không có 2 chỉnh sửa này) — đã sửa
+     `_wrap_tls()` để áp dụng đúng
+     `set_ciphers("ALL:!aNULL:!eNULL:@SECLEVEL=0")` (trên OpenSSL) và bật
+     `SSL_OP_LEGACY_SERVER_CONNECT`, đồng thời đổi biên phiên bản TLS từ
+     `TLSv1`-mặc định sang `TLSv1_2`–`TLSv1_3` khớp cấu hình đã được xác
+     nhận hoạt động trong `pymobiledevice3`.
+  **Vẫn chưa test được với phần cứng thật** — 2 lỗi trên được xác nhận qua
+  đối chiếu 3 nguồn độc lập (rất đáng tin cậy về mặt lý thuyết), nhưng AFC và
+  các bước sau TLS vẫn có thể còn vấn đề chưa lộ ra vì chưa từng chạy tới
+  được bước đó trên thiết bị thật.
 
 ---
 
@@ -231,7 +283,7 @@ có Gradle, không có trình giả lập/thiết bị Android, và không có i
 | `utils.py` (giải nén/ký IPA, đọc plist) | Cao | Thuần Python, không đổi so với bản gốc |
 | USB Host API claim/bulk transfer (`UsbTransport.kt`) | Trung bình | Dùng đúng API chuẩn của Android, nhưng chưa test với iPhone thật cắm qua USB |
 | **`mux_usb.py`** (giao thức usbmux tự viết lại) | **Thấp — CHƯA KIỂM CHỨNG TRÊN PHẦN CỨNG** | 4 lỗi định dạng gói tin đã sửa sau khi đối chiếu byte-for-byte với `libimobiledevice/usbmuxd` (mục 2) — về lý thuyết khớp đúng giao thức thật, nhưng vẫn CHƯA có lần bắt tay/pairing nào chạy qua trên iPhone/Android thật để xác nhận |
-| **`device_link.py`**, đặc biệt `TlsLockdownClient`/`start_session_tls` | **Thấp — CHƯA KIỂM CHỨNG** | Nâng cấp TLS thủ công qua `ssl.MemoryBIO`, chưa test |
+| **`device_link.py`**, đặc biệt pairing (`pair_device`) và TLS (`TlsLockdownClient`/`start_session_tls`) | **Thấp-Trung bình — CHƯA KIỂM CHỨNG TRÊN PHẦN CỨNG** | 2 lỗi đã sửa sau khi đối chiếu chéo `libimobiledevice` + `pymobiledevice3` (mục 2): thiếu `DeviceCertificate` trong PairRecord, và thiếu hạ `@SECLEVEL`/bật legacy renegotiation cho TLS. Về lý thuyết khớp đúng cấu hình đã xác nhận hoạt động trong `pymobiledevice3`, nhưng nâng cấp TLS qua `ssl.MemoryBIO` bơm tay là phần tự ráp nối — vẫn CHƯA có lần chạy thật nào tới được bước AFC/cài đặt |
 | **AFC (đẩy file lên iPhone)** | **Thấp — CHƯA KIỂM CHỨNG** | Giao thức nhị phân tự triển khai lại theo tài liệu |
 
 **Vì sao rủi ro nằm ở lớp USB:** Chạy `usbmuxd` (daemon chuẩn của Apple/
