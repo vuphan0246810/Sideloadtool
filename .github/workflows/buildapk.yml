@@ -34,13 +34,26 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK platform/build-tools Chaquopy/AGP need
+      - name: Install Android NDK + cmdline-tools packages Chaquopy/AGP need
         run: |
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" > /dev/null
 
-      # Repo này không commit gradle-wrapper.jar (môi trường viết code - Replit
-      # - không có Java/Gradle để tự tạo wrapper một cách đáng tin cậy).
+      # Chaquopy chạy pip trên chính máy build (không phải trên máy ảo Android)
+      # để tải/đóng gói các thư viện Python (requests, cryptography, srp...).
+      # Việc này cần một Python 3.11 thật trên PATH của runner (phải khớp đúng
+      # major.minor với `version = "3.11"` khai báo trong app/build.gradle.kts,
+      # xem https://chaquo.com/chaquopy/doc/current/android.html#buildpython).
+      # ubuntu-latest không đảm bảo có sẵn `python3.11`/`python3`/`python` trỏ
+      # đúng bản 3.11 trên PATH, nên nếu thiếu bước này, Gradle sẽ báo lỗi
+      # "Couldn't find Python 3.11" khi chạy task :app:installDebugPythonRequirements.
+      - name: Set up build Python (3.11, required by Chaquopy)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Dự án này không commit gradle-wrapper.jar (môi trường viết code -
+      # Replit - không có Java/Gradle để tự tạo wrapper một cách đáng tin cậy).
       # setup-gradle tự tải về đúng bản Gradle khai báo ở `gradle-version` và
       # cache lại giữa các lần chạy, nên ta gọi thẳng `gradle` thay vì `./gradlew`.
       - name: Set up Gradle
