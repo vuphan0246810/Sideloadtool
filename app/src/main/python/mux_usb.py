@@ -26,16 +26,41 @@ Kiến trúc:
     "kết nối" logic (lockdownd, AFC, installation_proxy, ...) trên cùng một
     ống USB vật lý, y hệt cách usbmuxd thật đa kênh hoá cho nhiều client.
 
-Giao thức (theo hiểu biết tốt nhất về usbmuxd/src/usb.h + device.h):
-  1. Bắt tay phiên bản: gửi version_header{major=2, minor=0, padding=0},
-     nhận lại cùng cấu trúc từ thiết bị. magic 0xfeedface được dùng làm
-     trường 'magic' trong mux_header cho version>=2.
-  2. Mỗi gói tin sau đó có mux_header (protocol, length, magic, tx_seq,
-     rx_seq) rồi tới payload. protocol=6 (giống IPPROTO_TCP) đóng gói một
-     "TCP header" tối giản (sport,dport,seq,ack,doff_flags,window,checksum,
-     urgent) mô phỏng bắt tay SYN/SYN-ACK/ACK rồi truyền dữ liệu qua các gói
-     PSH+ACK, đóng bằng FIN — gần như một triển khai TCP tối giản chạy trên
-     "IP ảo" là chính sợi cáp USB.
+Giao thức (đã đối chiếu byte-for-byte với mã nguồn tham khảo chính chủ
+libimobiledevice/usbmuxd, file src/device.c — hàm device_add(),
+device_version_input(), device_data_input(), send_packet(), send_tcp(),
+device_tcp_input() — ngày 2026-07-12, xem mục "2. Đã sửa trong bản này" của
+README.md để biết chi tiết từng điểm khác biệt so với bản trước):
+  1. Bắt tay phiên bản DÙNG HEADER NGẮN 8 BYTE (chỉ {protocol:u32, length:u32},
+     KHÔNG có magic/tx_seq/rx_seq) — vì mux_header_size trong usbmuxd thật
+     luôn được tính là `(dev->version < 2) ? 8 : sizeof(mux_header)`, và
+     dev->version bắt đầu bằng 0 (<2) cho tới khi gói version-reply được xử
+     lý xong. Cả gói version request (host gửi) VÀ gói version reply (thiết
+     bị trả) đều dùng header 8 byte này, payload là version_header{major,
+     minor,padding} 12 byte (3×u32 big-endian) — tổng 20 byte mỗi gói.
+     Bản trước của file này gửi/nhận gói version bằng header 20 byte (đủ
+     magic+tx_seq+rx_seq) — sai kích thước ngay từ gói đầu tiên, khiến toàn
+     bộ phần đọc payload lệch byte và thiết bị bị coi là "không phản hồi
+     đúng bắt tay phiên bản" (đúng lỗi người dùng gặp).
+  2. Ngay sau khi thương lượng version>=2 thành công, phải gửi một gói
+     MUX_PROTO_SETUP (payload 1 byte "\x07", không có "header" riêng) —
+     usbmuxd thật gửi gói này ngay trong device_version_input() trước khi
+     coi thiết bị là "active". Gói SETUP này cũng là lúc tx_seq/rx_seq bị
+     RESET về 0 / 0xFFFF (xem send_packet() case MUX_PROTO_SETUP). Bản
+     trước không hề gửi gói SETUP này.
+  3. Từ đây, mỗi gói dùng mux_header ĐẦY ĐỦ 16 BYTE: {protocol:u32,
+     length:u32, magic:u32, tx_seq:u16, rx_seq:u16} — chú ý tx_seq/rx_seq là
+     16-bit, KHÔNG phải 32-bit. Bản trước dùng format "!IIIII" (5×u32 = 20
+     byte) — sai 4 byte mỗi gói kể từ gói thứ hai trở đi, tự nó đã đủ làm
+     hỏng toàn bộ phần lockdown/pairing dù gói version có sửa đúng hay
+     không.
+  4. protocol=6 (giống IPPROTO_TCP) đóng gói một "TCP header" tối giản
+     (sport,dport,seq,ack,doff_flags,window,checksum,urgent) mô phỏng bắt
+     tay SYN/SYN-ACK/ACK rồi truyền dữ liệu qua các gói PSH+ACK, đóng bằng
+     FIN. Trường window 16-bit được usbmuxd thật SCALE >>8 khi gửi (và <<8
+     khi đọc) để nhồi window thật (131072, không vừa 16-bit) vào trường 16
+     -bit — bản trước gửi thẳng 131072 vào một trường "H" (struct.pack sẽ
+     ném ngoại lệ vì 131072 > 65535), một lỗi crash độc lập với 2 lỗi trên.
 """
 
 import struct
@@ -58,8 +83,22 @@ TCP_FLAG_RST = 0x04
 TCP_FLAG_PSH = 0x08
 TCP_FLAG_ACK = 0x10
 
-_HEADER_FMT = "!IIIII"  # protocol, length, magic, tx_seq, rx_seq
+# Header "đầy đủ" (version >= 2): protocol, length, magic, tx_seq(u16), rx_seq(u16) = 16 byte.
+# usbmuxd/src/device.h: struct mux_header { uint32_t protocol; uint32_t length; uint32_t magic;
+#                                            uint16_t tx_seq; uint16_t rx_seq; };
+_HEADER_FMT = "!IIIHH"
 _HEADER_LEN = struct.calcsize(_HEADER_FMT)
+assert _HEADER_LEN == 16
+
+# Header "ngắn" (version < 2, tức là dùng riêng cho đúng cặp gói version
+# request/reply lúc chưa thương lượng xong): chỉ protocol + length = 8 byte.
+_SHORT_HEADER_FMT = "!II"
+_SHORT_HEADER_LEN = struct.calcsize(_SHORT_HEADER_FMT)
+assert _SHORT_HEADER_LEN == 8
+
+_VERSION_HDR_FMT = "!III"  # major, minor, padding
+_VERSION_HDR_LEN = struct.calcsize(_VERSION_HDR_FMT)
+
 _TCPHDR_FMT = "!HHIIBBHHH"  # sport,dport,seq,ack,doff,flags,window,checksum,urgent
 _TCPHDR_LEN = struct.calcsize(_TCPHDR_FMT)
 
@@ -185,20 +224,35 @@ class MuxDevice:
         self._io_lock = threading.Lock()
         self._tx_seq = 0
         self._rx_seq = 0
+        # 0 = chưa thương lượng (dùng header ngắn 8 byte, giống dev->version=0
+        # trong usbmuxd thật — xem device_add()/device_data_input()).
+        self._version = 0
         self._connections = {}
         self._next_src_port = 40000
         self._pump_thread = None
         self._stop = threading.Event()
 
     def start(self):
-        print("[mux] Bắt tay phiên bản usbmux qua USB...")
-        version_payload = struct.pack("!III", VERSION_MAJOR, VERSION_MINOR, 0)
+        print("[mux] Bắt tay phiên bản usbmux qua USB (header ngắn 8 byte)...")
+        version_payload = struct.pack(_VERSION_HDR_FMT, VERSION_MAJOR, VERSION_MINOR, 0)
         self._send_raw(MUX_PROTO_VERSION, version_payload)
         header, payload = self._recv_raw()
-        if header[0] != MUX_PROTO_VERSION or len(payload) < 8:
+        protocol = header[0]
+        if protocol != MUX_PROTO_VERSION or len(payload) < _VERSION_HDR_LEN:
             raise MuxError("Thiết bị không phản hồi đúng bắt tay phiên bản usbmux.")
-        major, minor, _ = struct.unpack("!III", payload[:12]) if len(payload) >= 12 else (0, 0, 0)
+        major, minor, _padding = struct.unpack(_VERSION_HDR_FMT, payload[:_VERSION_HDR_LEN])
+        if major not in (1, 2):
+            raise MuxError(f"Thiết bị dùng phiên bản usbmux không được hỗ trợ: {major}.{minor}.")
         print(f"[mux] Thiết bị chấp nhận phiên bản usbmux {major}.{minor}.")
+
+        # Từ đây header đầy đủ 16 byte được dùng (xem _header_size()). Phải
+        # set self._version TRƯỚC khi gửi gói SETUP để _send_raw() chọn đúng
+        # định dạng — đúng thứ tự usbmuxd thật làm trong device_version_input().
+        self._version = major
+        if self._version >= 2:
+            # usbmuxd thật: gói MUX_PROTO_SETUP không có "header" phụ, chỉ có
+            # payload 1 byte "\x07", và đây là lúc tx_seq/rx_seq bị reset.
+            self._send_raw(MUX_PROTO_SETUP, b"\x07")
 
         self._pump_thread = threading.Thread(target=self._pump_loop, daemon=True)
         self._pump_thread.start()
@@ -206,21 +260,47 @@ class MuxDevice:
     def stop(self):
         self._stop.set()
 
+    def _header_size(self):
+        return _HEADER_LEN if self._version >= 2 else _SHORT_HEADER_LEN
+
     def _send_raw(self, protocol, payload: bytes):
-        self._tx_seq += 1
-        header = struct.pack(_HEADER_FMT, protocol, _HEADER_LEN + len(payload), MAGIC, self._tx_seq, self._rx_seq)
+        header_size = self._header_size()
+        total_len = header_size + len(payload)
+        if header_size == _HEADER_LEN:
+            if protocol == MUX_PROTO_SETUP:
+                # send_packet() trong device.c reset seq ngay trước gói SETUP
+                # đầu tiên: dev->tx_seq = 0; dev->rx_seq = 0xFFFF;
+                self._tx_seq = 0
+                self._rx_seq = 0xFFFF
+            header = struct.pack(
+                _HEADER_FMT, protocol, total_len, MAGIC,
+                self._tx_seq & 0xFFFF, self._rx_seq & 0xFFFF,
+            )
+            self._tx_seq = (self._tx_seq + 1) & 0xFFFF
+        else:
+            header = struct.pack(_SHORT_HEADER_FMT, protocol, total_len)
         with self._io_lock:
             self._io.write(header + payload)
 
     def _recv_raw(self, timeout_s=15.0):
-        raw_header = self._io.read_exact(_HEADER_LEN, timeout_s=timeout_s)
-        protocol, length, magic, tx_seq, rx_seq = struct.unpack(_HEADER_FMT, raw_header)
-        if length < _HEADER_LEN:
+        header_size = self._header_size()
+        raw_header = self._io.read_exact(header_size, timeout_s=timeout_s)
+        if header_size == _HEADER_LEN:
+            protocol, length, magic, tx_seq, rx_seq = struct.unpack(_HEADER_FMT, raw_header)
+            # usbmuxd thật gương lại đúng trường rx_seq (không phải tx_seq)
+            # của gói vừa nhận làm rx_seq cho gói kế tiếp ta gửi đi — xem
+            # device_data_input(): "if (dev->version >= 2) dev->rx_seq =
+            # ntohs(mhdr->rx_seq);". Đây là quy ước bắt buộc phải theo đúng
+            # dù không thực sự có ý nghĩa "ACK" như TCP thật.
+            self._rx_seq = rx_seq
+        else:
+            protocol, length = struct.unpack(_SHORT_HEADER_FMT, raw_header)
+            tx_seq = rx_seq = 0
+        if length < header_size:
             raise MuxError(f"mux_header length không hợp lệ: {length}")
-        payload_len = length - _HEADER_LEN
+        payload_len = length - header_size
         payload = self._io.read_exact(payload_len, timeout_s=timeout_s) if payload_len else b""
-        self._rx_seq = tx_seq
-        return (protocol, length, magic, tx_seq, rx_seq), payload
+        return (protocol, length, tx_seq, rx_seq), payload
 
     def _pump_loop(self):
         while not self._stop.is_set():
@@ -233,6 +313,15 @@ class MuxDevice:
                 time.sleep(0.2)
                 continue
             protocol = header[0]
+            if protocol == MUX_PROTO_CONTROL:
+                # device_control_input() thật: byte đầu là loại (3=ERROR,
+                # 5=WARNING, 7=INFO), phần còn lại là chuỗi thông báo — log
+                # lại để dễ chẩn đoán khi thiết bị từ chối/báo lỗi ở tầng mux.
+                if payload:
+                    kind = {3: "ERROR", 5: "WARNING", 7: "INFO"}.get(payload[0], f"type{payload[0]}")
+                    msg = payload[1:].decode("utf-8", errors="replace")
+                    print(f"[mux][control:{kind}] {msg}")
+                continue
             if protocol != MUX_PROTO_TCP or len(payload) < _TCPHDR_LEN:
                 continue
             sport, dport, seq, ack, doff, flags, window, checksum, urgent = struct.unpack(
@@ -243,16 +332,20 @@ class MuxDevice:
             # trên device, dport=cổng "ảo" ta tự chọn ở host. Tra theo dport.
             conn = self._connections.get(dport)
             if conn:
-                conn.peer_window = window or DEFAULT_WINDOW
+                # window trên dây bị usbmuxd thật scale >>8 khi gửi để nhồi
+                # window thật (có thể > 65535) vào trường 16-bit — phải <<8
+                # lại khi đọc, xem send_tcp()/device_tcp_input() trong device.c.
+                conn.peer_window = (window << 8) or DEFAULT_WINDOW
                 conn._on_segment(flags, seq, ack, data)
 
     def _send_tcp(self, conn: "MuxConnection", flags: int, payload: bytes):
+        window_field = (DEFAULT_WINDOW >> 8) & 0xFFFF
         tcp_header = struct.pack(
             _TCPHDR_FMT,
             conn.src_port, conn.dst_port,
             conn.seq, conn.ack,
             (5 << 4), flags,
-            DEFAULT_WINDOW, 0, 0,
+            window_field, 0, 0,
         )
         self._send_raw(MUX_PROTO_TCP, tcp_header + payload)
 

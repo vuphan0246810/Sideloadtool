@@ -180,6 +180,41 @@ build/test được trên phần cứng thật ở môi trường viết code n�
   `sideload_core.py`). Không đặt trực tiếp trong `jniLibs/` như `libzsign.so`
   được vì tên file có hậu tố phiên bản (`.so.3`) không khớp quy ước
   `lib*.so` mà trình cài đặt Android dùng để giải nén thư viện native.
+- **Sửa nguyên nhân gốc của lỗi "Thiết bị không phản hồi đúng bắt tay phiên
+  bản usbmux" (không bao giờ thấy hộp thoại "Trust This Computer?" trên
+  iPhone, USB tự rút sau đó):** đối chiếu byte-for-byte `mux_usb.py` với mã
+  nguồn tham khảo chính chủ
+  [libimobiledevice/usbmuxd](https://github.com/libimobiledevice/usbmuxd)
+  (`src/device.c`, `src/device.h`) phát hiện **3 lỗi định dạng giao thức
+  độc lập nhau**, đều nằm ở `mux_usb.py`, đủ để một mình mỗi lỗi cũng làm
+  hỏng hoàn toàn luồng ghép nối:
+  1. Gói bắt tay phiên bản (version handshake) — gói ĐẦU TIÊN gửi đi khi vừa
+     mở USB — phải dùng header **ngắn 8 byte** (`{protocol, length}`, không
+     có `magic`/`tx_seq`/`rx_seq`), vì usbmuxd thật luôn tính
+     `mux_header_size = (dev->version < 2) ? 8 : 16` và version bắt đầu ở
+     0. Bản trước luôn gửi/nhận gói version bằng header 20 byte (đủ cả
+     magic+seq) — sai kích thước ngay từ gói đầu tiên, khiến phần đọc
+     payload lệch byte và bị tưởng là "thiết bị không phản hồi đúng" — đúng
+     y lỗi bạn gặp.
+  2. Với mọi gói tin sau bắt tay (version>=2), `mux_header` thật chỉ dài
+     **16 byte**: `tx_seq`/`rx_seq` là **16-bit**, không phải 32-bit. Bản
+     trước dùng định dạng 5×32-bit (20 byte) — lệch 4 byte mỗi gói, nên kể
+     cả khi lỗi (1) được sửa riêng, mọi gói TCP-mô-phỏng dùng để mở kết nối
+     tới lockdownd (bước tạo ra hộp thoại "Trust") vẫn sẽ hỏng.
+  3. Gói `MUX_PROTO_SETUP` (bắt buộc phải gửi ngay sau khi bắt tay version
+     thành công, trước khi coi thiết bị là sẵn sàng) **hoàn toàn chưa được
+     gửi** ở bản trước.
+  4. Lỗi thứ 4, độc lập, sẽ crash ngay khi mở kết nối TCP-mô-phỏng đầu
+     tiên: trường "window" 16-bit được gán trực tiếp giá trị 131072 (vượt
+     quá giới hạn 65535 của kiểu 16-bit) — usbmuxd thật luôn dịch phải 8
+     bit (`>>8`) trước khi ghi vào trường này (và dịch trái lại khi đọc).
+  Đã sửa cả 4 điểm trên trong `mux_usb.py`, theo đúng logic của
+  `device_add()`, `device_version_input()`, `device_data_input()`,
+  `send_packet()`/`send_tcp()` trong `device.c`. **Vẫn chưa test được với
+  phần cứng thật** (xem mục 3) — đây là sửa theo đối chiếu mã nguồn tham
+  khảo, không phải xác nhận bằng bắt gói tin thật; nhiều khả năng vẫn còn
+  vấn đề ở tầng pairing/TLS (`device_link.py`) hoặc AFC sau khi bắt tay mux
+  hoạt động đúng.
 
 ---
 
@@ -195,7 +230,7 @@ có Gradle, không có trình giả lập/thiết bị Android, và không có i
 | `apple_auth.py`, `developer_api.py` | Cao | Copy gần như nguyên vẹn từ bản CLI gốc đã hoạt động trong Termux, chỉ đổi `input()` |
 | `utils.py` (giải nén/ký IPA, đọc plist) | Cao | Thuần Python, không đổi so với bản gốc |
 | USB Host API claim/bulk transfer (`UsbTransport.kt`) | Trung bình | Dùng đúng API chuẩn của Android, nhưng chưa test với iPhone thật cắm qua USB |
-| **`mux_usb.py`** (giao thức usbmux tự viết lại) | **Thấp — CHƯA KIỂM CHỨNG** | Xem chi tiết bên dưới |
+| **`mux_usb.py`** (giao thức usbmux tự viết lại) | **Thấp — CHƯA KIỂM CHỨNG TRÊN PHẦN CỨNG** | 4 lỗi định dạng gói tin đã sửa sau khi đối chiếu byte-for-byte với `libimobiledevice/usbmuxd` (mục 2) — về lý thuyết khớp đúng giao thức thật, nhưng vẫn CHƯA có lần bắt tay/pairing nào chạy qua trên iPhone/Android thật để xác nhận |
 | **`device_link.py`**, đặc biệt `TlsLockdownClient`/`start_session_tls` | **Thấp — CHƯA KIỂM CHỨNG** | Nâng cấp TLS thủ công qua `ssl.MemoryBIO`, chưa test |
 | **AFC (đẩy file lên iPhone)** | **Thấp — CHƯA KIỂM CHỨNG** | Giao thức nhị phân tự triển khai lại theo tài liệu |
 
