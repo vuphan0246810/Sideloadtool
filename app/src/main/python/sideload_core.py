@@ -535,7 +535,24 @@ def do_sideload(ipa_path: str, apple_id: str, password: str, udid_override: str 
         device_exists = any(d.get("deviceNumber") == udid or d.get("udid") == udid for d in devices)
         if not device_exists:
             print(f"Đang đăng ký thiết bị {udid}...")
-            dev_api.register_device(udid, f"iPhone-{udid[:8]}")
+            # [FIX] Bản cũ gọi register_device(udid, f"iPhone-{udid[:8]}") —
+            # NGƯỢC thứ tự so với chữ ký thật register_device(device_name,
+            # device_udid) bên developer_api.py. Hậu quả: Apple nhận
+            # deviceNumber="iPhone-XXXXXXXX" (chuỗi giả) và name=<UDID thật>,
+            # tức là UDID thật KHÔNG BAO GIỜ được đăng ký — Apple vẫn coi
+            # team "chưa có thiết bị nào", nên downloadTeamProvisioningProfile
+            # luôn thất bại với resultCode 8220 "Your team has no devices
+            # from which to generate a provisioning profile" dù USB đã kết
+            # nối và UDID đọc được đúng. Kết quả trả về cũng không hề được
+            # kiểm tra nên lỗi này bị nuốt hoàn toàn, im lặng đi tiếp tới tận
+            # bước tải profile mới lộ ra.
+            registered_device = dev_api.register_device(f"iPhone-{udid[:8]}", udid)
+            if not registered_device:
+                last_err = getattr(dev_api, "last_error", None)
+                print(f"Lỗi: Không thể đăng ký thiết bị {udid} với Apple "
+                      f"({last_err or 'không rõ nguyên nhân'}).")
+                return False
+            print(f"[device] ✅ Đã đăng ký thiết bị {udid} với Apple.")
         else:
             print("Thiết bị đã được đăng ký.")
 

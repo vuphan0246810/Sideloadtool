@@ -147,6 +147,20 @@ build/test được trên phần cứng thật ở môi trường viết code n�
      đang cắm dùng, để giải phóng chỗ rồi tạo App ID mới cho app hiện tại;
      (c) chỉ khi không còn cách nào khác mới mượn tạm một App ID có sẵn bất
      kỳ trên tài khoản (hành vi gốc, giữ lại làm phương án cuối).
+- **Sửa lỗi "Your team has no devices from which to generate a provisioning
+  profile" (resultCode 8220) khi tải Provisioning Profile:** nguyên nhân là
+  một bug đảo ngược thứ tự tham số ở lời gọi
+  `dev_api.register_device(udid, f"iPhone-{udid[:8]}")` trong
+  `sideload_core.py` — chữ ký thật của hàm là
+  `register_device(device_name, device_udid)`, nên Apple thực nhận
+  `deviceNumber="iPhone-XXXXXXXX"` (chuỗi giả) và `name=<UDID thật>`. Kết quả:
+  UDID thật của iPhone **không bao giờ thực sự được đăng ký** với Apple, dù
+  log không báo lỗi gì ở bước đó (giá trị trả về của `register_device()`
+  cũng chưa từng được kiểm tra). Tới bước tải Provisioning Profile, Apple
+  thấy team chưa có thiết bị nào nên báo lỗi 8220 — đúng lỗi trong log bạn
+  gửi. Đã sửa: gọi đúng thứ tự tham số, và giờ luôn kiểm tra kết quả đăng ký
+  thiết bị — nếu thất bại sẽ dừng lại và báo lỗi rõ ràng ngay ở bước 1.5/6
+  thay vì âm thầm đi tiếp rồi mới lộ lỗi khó hiểu ở bước tải profile.
 
 ---
 

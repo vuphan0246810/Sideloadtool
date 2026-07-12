@@ -222,6 +222,7 @@ class DeveloperAPI:
 
     def register_device(self, device_name, device_udid):
         print(f"[developer_api] Registering device {device_name} ({device_udid})...")
+        self.last_error = None
         try:
             response = self._make_developer_request("ios/addDevice.action", extra_params={
                 "deviceNumber": device_udid,
@@ -231,9 +232,22 @@ class DeveloperAPI:
             if device:
                 print(f"[developer_api] Device {device_name} registered successfully.")
                 return device
+            # [FIX] Trước đây lỗi ở đây bị "nuốt" hoàn toàn — không lưu vào
+            # last_error nên caller (sideload_core.py) không có cách nào biết
+            # đăng ký thất bại, và (bug riêng) trước đây caller cũng không
+            # thèm kiểm tra giá trị trả về, nên UDID không đăng ký được vẫn
+            # đi tiếp bình thường tới bước tạo Provisioning Profile — nơi lỗi
+            # thật (resultCode 8220 "Your team has no devices...") mới lộ ra,
+            # rất khó truy về đúng nguyên nhân. Giờ lưu lại để log rõ ràng.
+            self.last_error = {
+                "resultCode": response.get("resultCode"),
+                "userString": response.get("userString") or response.get("resultString") or "",
+                "raw": response,
+            }
             print(f"[developer_api] Failed to register device: {response}")
             return None
         except Exception as e:
+            self.last_error = {"resultCode": -1, "userString": str(e)}
             print(f"[developer_api] Error registering device: {e}")
             return None
 
