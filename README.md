@@ -126,6 +126,27 @@ build/test được trên phần cứng thật ở môi trường viết code n�
   `servers.sidestore.io`, hoặc nhập URL riêng. Lựa chọn này được dùng thật ở
   tab Sideload và Thu hồi Certificate (trước đây cả hai tab luôn truyền
   `null`, bỏ qua hoàn toàn phần chọn server dù logic backend đã có sẵn).
+- **Sửa lỗi đăng ký App ID thất bại ("An App ID with Identifier '...' is not
+  available") + tự động tái sử dụng App ID khi đạt giới hạn 10/7 ngày:**
+  bản trước gặp 2 vấn đề khi xử lý App ID:
+  1. Apple trả lỗi resultCode **9401** ("is not available") khi bundle id bị
+     trùng **TOÀN CẦU** (bundle id là chuỗi duy nhất trên toàn Apple Developer,
+     không riêng tài khoản bạn — rất hay gặp với bundle id mặc định chưa đổi
+     như `com.SideStore.SideStore` vì rất nhiều người khác cũng từng đăng ký
+     đúng chuỗi đó bằng tài khoản riêng của họ). Bản cũ coi đây là lỗi chết,
+     dừng luôn. Giờ `sideload_core.py::_resolve_app_id()` tự phát hiện đúng
+     loại lỗi này (`developer_api.classify_app_id_error()`), tự thêm một hậu
+     tố **ổn định** riêng cho tài khoản (không đổi mỗi lần chạy lại) vào
+     bundle id rồi thử đăng ký lại — đúng cách AltStore/SideStore/iLoader xử
+     lý tình huống này.
+  2. Lỗi **giới hạn 10 App ID mới / 7 ngày** (tài khoản Apple ID miễn phí)
+     giờ được xử lý theo đúng thứ tự ưu tiên: (a) nếu app đang cài đã có App
+     ID đăng ký trong 7 ngày gần nhất (lưu trong `sideload_state.json`) thì
+     dùng lại ngay, không tốn thêm hạn mức; (b) nếu chưa, tự tìm và xoá một
+     App ID **cũ do chính tool này tạo** mà hiện không app nào trên thiết bị
+     đang cắm dùng, để giải phóng chỗ rồi tạo App ID mới cho app hiện tại;
+     (c) chỉ khi không còn cách nào khác mới mượn tạm một App ID có sẵn bất
+     kỳ trên tài khoản (hành vi gốc, giữ lại làm phương án cuối).
 
 ---
 

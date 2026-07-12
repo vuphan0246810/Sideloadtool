@@ -17,23 +17,29 @@ Cũng chịu trách nhiệm:
 """
 
 import builtins
+import hashlib
 import os
 import plistlib
 import shutil
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from com.superalpha.sideload.bridge import AppPaths, NativeLog, UiPrompt
 
 from apple_auth import AppleAuth, fetch_official_servers
-from developer_api import DeveloperAPI
+from developer_api import DeveloperAPI, classify_app_id_error
 from utils import (
     run_command, extract_ipa, find_app_bundle, get_bundle_id, get_app_name,
     set_bundle_id, save_certificate_as_pem, decode_apple_data_field,
 )
 import config_manager
 import device_link
+
+# Apple: tài khoản Apple ID miễn phí chỉ được tạo tối đa 10 App ID MỚI mỗi
+# 7 ngày — mỗi App ID mới tạo cũng chỉ "sống" đủ 7 ngày trước khi bị Apple
+# tự vô hiệu. Toàn bộ hằng số ngày dưới đây tham chiếu đúng chu kỳ 7 ngày này.
+APP_ID_QUOTA_WINDOW_DAYS = 7
 
 # ── Chuyển hướng print() sang NativeLog (Kotlin SharedFlow -> LogConsole UI) ──
 _original_print = builtins.print
@@ -245,7 +251,78 @@ def _try_reuse_existing_cert(dev_api, state, cert_pem_path, key_pem_path):
         return False
 
 
+# ═════════════════════════════════════════════════════════════════════
+# Quản lý App ID — đăng ký / tái sử dụng trong hạn mức 10 App ID / 7 ngày
+#
+# Đây là phần được viết lại theo đúng cách iLoader, AltStore/SideStore và
+# các tool sideload khác xử lý 2 tình huống lỗi khác nhau khi tạo App ID
+# (xem classify_app_id_error() trong developer_api.py):
+#
+#   'unavailable' — bundle id bị trùng TOÀN CẦU (không phải do giới hạn tài
+#                   khoản của bạn). Xử lý: tự thêm hậu tố riêng cho tài
+#                   khoản (ổn định, không đổi mỗi lần chạy) rồi thử lại.
+#   'quota'       — tài khoản đã dùng hết 10 App ID mới trong 7 ngày. Xử lý:
+#                   (1) nếu app NÀY đã có App ID đăng ký trong 7 ngày qua
+#                       (lưu trong registry cục bộ) → dùng lại luôn, không
+#                       cần tạo mới, không tính vào hạn mức.
+#                   (2) nếu chưa, tìm một App ID CŨ DO CHÍNH TOOL NÀY tạo mà
+#                       hiện không app nào (trên thiết bị đang cắm) dùng →
+#                       xoá nó để giải phóng chỗ, rồi tạo App ID mới.
+# ═════════════════════════════════════════════════════════════════════
+
+def _app_id_registry(state):
+    return state.setdefault("app_id_registry", {})
+
+
+def _stable_bundle_suffix(apple_id: str, original_bundle_id: str) -> str:
+    """Hậu tố ỔN ĐỊNH (luôn ra cùng 1 giá trị cho cùng Apple ID + bundle id
+    gốc) — KHÔNG dùng uuid/random ở bước đầu, để:
+      1. Không đổi bundle id mỗi lần chạy lại (App ID cũ vẫn còn hạn 7 ngày
+         thì lần chạy sau tìm lại đúng App ID đó qua list_app_ids(), không
+         tạo App ID mới tốn hạn mức).
+      2. Có tính riêng tư/khó đoán hơn 1 hậu tố cố định kiểu ".sideload" mà
+         nhiều người dùng chung — mỗi Apple ID ra một hậu tố khác nhau nên
+         không tự đụng lẫn nhau khi cùng đăng ký 1 app phổ biến.
+    Đây đúng là cách AltServer xử lý bundle id của SideStore (thêm hậu tố
+    theo Team ID / Apple ID để tránh trùng bundle id 'com.SideStore.SideStore'
+    mà rất nhiều người khác cũng đã đăng ký trước đó với TÀI KHOẢN CỦA HỌ)."""
+    digest = hashlib.sha1(f"{apple_id.strip().lower()}:{original_bundle_id}".encode("utf-8")).hexdigest()
+    return digest[:8]
+
+
+def _find_app_id_by_identifier(app_ids, identifier):
+    for a in app_ids:
+        if (a.get("identifier") or a.get("bundleId")) == identifier:
+            return a
+    return None
+
+
+def _registry_entry_expired(entry) -> bool:
+    created_at = entry.get("created_at")
+    if not created_at:
+        return True
+    try:
+        created_dt = datetime.fromisoformat(created_at)
+    except Exception:
+        return True
+    return (datetime.now(timezone.utc) - created_dt) >= timedelta(days=APP_ID_QUOTA_WINDOW_DAYS)
+
+
+def _remember_app_id(state, original_bundle_id, identifier, app_id_obj, now_iso):
+    registry = _app_id_registry(state)
+    registry[original_bundle_id] = {
+        "identifier": identifier,
+        "app_id_id": _first_present(app_id_obj, ["appIdId", "id"]),
+        "created_at": now_iso,
+    }
+    _save_state(state)
+
+
 def _choose_replacement_app_id(app_ids, original_bundle_id, installed_bundle_ids):
+    """[Fallback cuối cùng] Tìm một App ID BẤT KỲ đang rảnh (không có app nào
+    trong installed_bundle_ids dùng) để đổi tên bundle id sang đó. Chỉ dùng
+    khi không còn cách nào khác (không tự xoá được App ID nào của tool này) —
+    xem cảnh báo trong _resolve_app_id(). Giữ nguyên logic gốc."""
     def identifier_of(a):
         return a.get("identifier") or a.get("bundleId") or ""
 
@@ -263,6 +340,159 @@ def _choose_replacement_app_id(app_ids, original_bundle_id, installed_bundle_ids
     for bucket in (exact, prefixed, other):
         if bucket:
             return identifier_of(bucket[0]), bucket[0]
+    return None, None
+
+
+def _free_up_app_id_quota(dev_api, state, udid, current_bundle_id):
+    """Cố gắng xoá 1 App ID CŨ DO CHÍNH TOOL NÀY tạo (ghi trong registry cục
+    bộ) để giải phóng 1 chỗ trong hạn mức 10/7 ngày. CHỈ xoá App ID:
+      - có trong registry (tức chính tool này đã tạo, không phải của Xcode
+        hay app khác cài thủ công);
+      - KHÔNG phải của app đang xử lý (current_bundle_id);
+      - KHÔNG thuộc app nào đang cài trên chính thiết bị đang cắm.
+    Trả True nếu xoá được ít nhất 1 App ID (nên thử tạo lại sau khi gọi hàm
+    này), False nếu không tìm được ứng viên an toàn để xoá."""
+    registry = _app_id_registry(state)
+    if not registry:
+        return False
+
+    try:
+        pair_record = _get_or_create_pair_record(udid)
+        installed_ids = set(device_link.list_installed_apps(pair_record))
+    except Exception as e:
+        print(f"[app_id] Không lấy được danh sách app đã cài trên thiết bị: {e} "
+              "— để an toàn, sẽ không tự xoá App ID nào.")
+        return False
+
+    # Ưu tiên xoá entry CŨ NHẤT trước (nhiều khả năng đã hết hạn sử dụng thật).
+    candidates = sorted(
+        (
+            (orig, entry) for orig, entry in registry.items()
+            if orig != current_bundle_id
+            and entry.get("identifier") not in installed_ids
+            and entry.get("app_id_id")
+        ),
+        key=lambda item: item[1].get("created_at", ""),
+    )
+    if not candidates:
+        print("[app_id] Không có App ID nào do tool này tạo mà hiện đang rảnh để xoá.")
+        return False
+
+    orig_bundle_id, entry = candidates[0]
+    print(f"[app_id] Giải phóng hạn mức: xoá App ID cũ '{entry.get('identifier')}' "
+          f"(đã đăng ký cho app '{orig_bundle_id}', không còn cài trên thiết bị này)...")
+    if dev_api.delete_app_id(entry["app_id_id"]):
+        registry.pop(orig_bundle_id, None)
+        _save_state(state)
+        time.sleep(2)
+        return True
+    return False
+
+
+def _resolve_app_id(dev_api, state, app_ids, bundle_id, app_name, app_bundle_path, apple_id, udid):
+    """Xác định App ID (và bundle id cuối cùng để ký) cho app đang sideload.
+
+    Trả (app_id_obj, final_bundle_id) — hoặc (None, None) nếu không thể.
+    Toàn bộ logic 'tự động tái sử dụng App ID trong 7 ngày' và 'tự động đổi
+    bundle id khi bị trùng toàn cục' nằm ở đây. Xem chú thích khối phía trên.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    registry = _app_id_registry(state)
+
+    # ── Bước 0: đã đăng ký App ID cho app NÀY trong 7 ngày qua? Dùng lại luôn,
+    # không tính vào hạn mức 10/7-ngày và không cần gọi addAppId.action nữa —
+    # đây chính là "tự động sử dụng lại app id" mà không cần đợi lỗi quota.
+    cached = registry.get(bundle_id)
+    if cached and not _registry_entry_expired(cached):
+        existing = _find_app_id_by_identifier(app_ids, cached["identifier"])
+        if existing:
+            print(f"[app_id] ✅ Tái sử dụng App ID đã đăng ký trước đó: {cached['identifier']} "
+                  f"(đăng ký lúc {cached['created_at']}, còn hạn trong {APP_ID_QUOTA_WINDOW_DAYS} ngày).")
+            if cached["identifier"] != bundle_id:
+                set_bundle_id(app_bundle_path, cached["identifier"])
+            return existing, cached["identifier"]
+        print(f"[app_id] App ID đã lưu ({cached['identifier']}) không còn thấy trên Apple "
+              "(có thể đã bị thu hồi/hết hạn) — sẽ đăng ký lại.")
+        registry.pop(bundle_id, None)
+
+    # ── Bước 1: bundle id gốc của IPA đã có sẵn trên tài khoản chưa?
+    existing = _find_app_id_by_identifier(app_ids, bundle_id)
+    if existing:
+        print(f"[app_id] Bundle id gốc '{bundle_id}' đã đăng ký sẵn trên tài khoản — dùng lại.")
+        _remember_app_id(state, bundle_id, bundle_id, existing, now_iso)
+        return existing, bundle_id
+
+    # ── Bước 2: thử tạo App ID mới với ĐÚNG bundle id gốc trước (không đổi
+    # gì nếu không cần thiết — một số app dùng bundle id để khớp entitlement/
+    # URL scheme, chỉ nên đổi khi thực sự bị trùng).
+    candidate_id = bundle_id
+    for attempt in range(4):
+        print(f"Đang tạo App ID cho {candidate_id}...")
+        app_id_obj = dev_api.create_app_id(candidate_id, app_name)
+        if app_id_obj:
+            if candidate_id != bundle_id:
+                set_bundle_id(app_bundle_path, candidate_id)
+            _remember_app_id(state, bundle_id, candidate_id, app_id_obj, now_iso)
+            return app_id_obj, candidate_id
+
+        error_kind = classify_app_id_error(dev_api.last_error)
+
+        if error_kind == "unavailable":
+            # [FIX chính] Đây là lỗi 9401 thấy trong log gốc: bundle id bị
+            # trùng TOÀN CẦU (thường do dùng bundle id mặc định của app, vd
+            # 'com.SideStore.SideStore', mà rất nhiều người khác cũng đã
+            # đăng ký bằng tài khoản riêng của họ) — KHÔNG liên quan đến hạn
+            # mức 10/7-ngày của chính bạn. Cách AltStore/SideStore/iLoader xử
+            # lý: tự thêm hậu tố rồi thử lại, không báo lỗi chết ngay.
+            if attempt == 0:
+                suffix = _stable_bundle_suffix(apple_id, bundle_id)
+                candidate_id = f"{bundle_id}.{suffix}"
+                print(f"[app_id] Bundle id '{bundle_id}' đã bị đăng ký bởi tài khoản khác "
+                      f"(App ID là duy nhất TOÀN CẦU, không riêng tài khoản bạn). "
+                      f"Tự đổi sang bundle id riêng cho tài khoản này: {candidate_id}")
+                # Hậu tố ổn định có thể đã được TÀI KHOẢN NÀY đăng ký từ trước
+                # (vd chạy tool lần trước) — kiểm tra lại danh sách trước khi
+                # thử tạo, để không tốn thêm hạn mức nếu không cần.
+                already = _find_app_id_by_identifier(app_ids, candidate_id)
+                if already:
+                    print(f"[app_id] ✅ Bundle id riêng '{candidate_id}' đã đăng ký sẵn — dùng lại.")
+                    set_bundle_id(app_bundle_path, candidate_id)
+                    _remember_app_id(state, bundle_id, candidate_id, already, now_iso)
+                    return already, candidate_id
+                continue
+            # Hậu tố ổn định CŨNG bị trùng (rất hiếm) — thêm vài ký tự ngẫu
+            # nhiên nữa và thử lại tối đa 2 lần nữa trước khi bỏ cuộc.
+            candidate_id = f"{bundle_id}.{_stable_bundle_suffix(apple_id, bundle_id)}{uuid.uuid4().hex[:4]}"
+            print(f"[app_id] Vẫn bị trùng — thử tiếp với: {candidate_id}")
+            continue
+
+        if error_kind == "quota":
+            print("[!] Đạt giới hạn 10 App ID mới / 7 ngày của tài khoản Apple ID này.")
+            if attempt == 0 and _free_up_app_id_quota(dev_api, state, udid, bundle_id):
+                print("[app_id] Đã giải phóng 1 chỗ — thử tạo lại App ID...")
+                continue
+            print("[!] Không tự giải phóng được hạn mức (không có App ID nào do tool này tạo "
+                  "mà hiện đang rảnh) — tìm 1 App ID có sẵn trên tài khoản để dùng tạm...")
+            try:
+                pair_record = _get_or_create_pair_record(udid)
+                installed_ids = set(device_link.list_installed_apps(pair_record))
+            except Exception as e:
+                print(f"[app_id] Không lấy được danh sách app đã cài: {e}")
+                installed_ids = set()
+            new_bundle_id, existing_app_id = _choose_replacement_app_id(app_ids, bundle_id, installed_ids)
+            if not new_bundle_id:
+                print("Lỗi: Đã đạt giới hạn App ID và không còn App ID nào trống để dùng lại.")
+                return None, None
+            print(f"[!] Dùng tạm App ID có sẵn trên tài khoản: {new_bundle_id} "
+                  "(App ID này KHÔNG do tool tạo cho app hiện tại — nếu bạn cũng dùng app "
+                  "gốc gắn với App ID đó ở nơi khác, có thể cần cài lại app đó sau).")
+            set_bundle_id(app_bundle_path, new_bundle_id)
+            return existing_app_id, new_bundle_id
+
+        print(f"Lỗi: Không thể tạo App ID mới ({dev_api.last_error}).")
+        return None, None
+
+    print("Lỗi: Không thể tạo App ID sau nhiều lần thử (bundle id liên tục bị trùng).")
     return None, None
 
 
@@ -365,30 +595,9 @@ def do_sideload(ipa_path: str, apple_id: str, password: str, udid_override: str 
         app_name = get_app_name(app_bundle_path)
 
         app_ids = dev_api.list_app_ids()
-        target_app_id = next((a for a in app_ids if a.get("identifier") == bundle_id), None)
-        final_bundle_id = bundle_id
-
-        if not target_app_id:
-            print(f"Đang tạo App ID mới cho {bundle_id}...")
-            target_app_id = dev_api.create_app_id(bundle_id, app_name)
-            if not target_app_id:
-                last_err = getattr(dev_api, "last_error", {}) or {}
-                user_string = str(last_err.get("userString", ""))
-                if "maximum number of App IDs" in user_string or "limit" in user_string.lower():
-                    print("[!] Đạt giới hạn 10 App ID/7 ngày — tìm App ID có sẵn để dùng lại...")
-                    pair_record = _get_or_create_pair_record(udid)
-                    installed_ids = set(device_link.list_installed_apps(pair_record))
-                    new_bundle_id, existing_app_id = _choose_replacement_app_id(app_ids, bundle_id, installed_ids)
-                    if not new_bundle_id:
-                        print("Lỗi: Không còn App ID nào trống để dùng lại.")
-                        return False
-                    print(f"[!] Dùng App ID có sẵn: {new_bundle_id}")
-                    set_bundle_id(app_bundle_path, new_bundle_id)
-                    final_bundle_id = new_bundle_id
-                    target_app_id = existing_app_id
-                else:
-                    print("Lỗi: Không thể tạo App ID mới.")
-                    return False
+        target_app_id, final_bundle_id = _resolve_app_id(
+            dev_api, state, app_ids, bundle_id, app_name, app_bundle_path, apple_id, udid,
+        )
 
         if not target_app_id:
             print("Lỗi: Không có App ID hợp lệ để ký.")

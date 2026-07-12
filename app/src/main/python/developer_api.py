@@ -8,6 +8,57 @@ import re
 from datetime import datetime
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Phân loại lỗi khi tạo App ID thất bại.
+#
+# Apple trả 2 loại lỗi HOÀN TOÀN KHÁC NHAU cho addAppId.action nhưng bản cũ
+# xử lý y hệt nhau (chỉ có 1 nhánh "limit" rồi coi mọi lỗi khác là chết hẳn):
+#
+#   (1) "unavailable" — resultCode 9401, userString dạng:
+#       "An App ID with Identifier 'com.foo.bar' is not available.
+#        Please enter a different string."
+#       Đây KHÔNG phải do giới hạn tài khoản — App ID là một chuỗi DUY NHẤT
+#       TOÀN CẦU trên toàn bộ Apple Developer (không chỉ trong team của bạn).
+#       Rất hay gặp với các app phổ biến dùng bundle id "mặc định" chưa đổi
+#       (vd 'com.SideStore.SideStore') vì HÀNG NGÀN người khác cũng từng thử
+#       đăng ký đúng chuỗi đó bằng tài khoản của riêng họ. AltStore/SideStore/
+#       iLoader và các tool sideload khác xử lý bằng cách: tự thêm một hậu
+#       tố (suffix) vào bundle id rồi thử lại, KHÔNG báo lỗi chết ngay.
+#
+#   (2) "quota" — tài khoản Apple ID miễn phí bị giới hạn tối đa 10 App ID
+#       MỚI mỗi 7 ngày (Apple: "You have reached the maximum number of App
+#       IDs for today. You may create up to 10 App IDs every 7 days."). Đây
+#       mới là giới hạn theo tài khoản — cách xử lý đúng là TÁI SỬ DỤNG một
+#       App ID đã có (của chính app này nếu đã đăng ký trước đó trong vòng 7
+#       ngày, hoặc giải phóng một App ID cũ do chính tool này tạo).
+# ─────────────────────────────────────────────────────────────────────
+
+_QUOTA_MARKERS = (
+    "maximum number of app ids",
+    "you may create up to",
+    "app id limit",
+    "every 7 days",
+    "created too many app ids",
+    "reached the maximum",
+)
+
+
+def classify_app_id_error(last_error):
+    """Trả 'unavailable' | 'quota' | 'other' dựa trên resultCode/userString
+    Apple trả về khi addAppId.action thất bại. Xem chú thích khối trên."""
+    if not last_error:
+        return "other"
+    result_code = last_error.get("resultCode")
+    user_string = str(last_error.get("userString", "") or "")
+    lower = user_string.lower()
+
+    if result_code == 9401 or "is not available" in lower or "enter a different string" in lower:
+        return "unavailable"
+    if any(marker in lower for marker in _QUOTA_MARKERS) or "limit" in lower:
+        return "quota"
+    return "other"
+
+
 class DeveloperAPI:
     """
     Client cho Apple Developer Services (developerservices2.apple.com).
@@ -24,6 +75,10 @@ class DeveloperAPI:
       FIX-3  _make_developer_request(): phát hiện resultCode 1100 (session
              expired) → tự invalidate cache + retry 1 lần với anisette mới
              thay vì cứng là ném Exception ngay.
+      FIX-4  Thêm classify_app_id_error() + delete_app_id() — nền tảng cho
+             chức năng tự động đổi bundle id khi bị trùng ('unavailable') và
+             tự động giải phóng/tái sử dụng App ID khi đạt giới hạn 10/7 ngày
+             ('quota'). Xem sideload_core.py::_resolve_app_id().
     """
 
     def __init__(self, apple_auth_instance, dsid, session_token):
@@ -210,13 +265,51 @@ class DeveloperAPI:
             if app_id:
                 print(f"[developer_api] App ID {bundle_id} created successfully.")
                 return app_id
-            self.last_error = response
+            # [FIX-4] Trước đây self.last_error = response (nguyên cả plist trả
+            # về) — resultCode/userString vẫn có trong đó nên vẫn đọc được,
+            # nhưng để chắc chắn classify_app_id_error() luôn có đủ 2 khoá này
+            # (đề phòng response thiếu 1 trong 2), chuẩn hoá lại tại đây.
+            self.last_error = {
+                "resultCode": response.get("resultCode"),
+                "userString": response.get("userString") or response.get("resultString") or "",
+                "raw": response,
+            }
             print(f"[developer_api] Failed to create App ID: {response}")
             return None
         except Exception as e:
             self.last_error = {"resultCode": -1, "userString": str(e)}
             print(f"[developer_api] Error creating App ID: {e}")
             return None
+
+    def delete_app_id(self, app_id_id):
+        """Xoá một App ID để giải phóng chỗ trong giới hạn 10 App ID/7 ngày.
+
+        [FIX-4] AltSign (ALTAppleAPI removeAppID:) gọi action
+        'ios/deleteAppId.action' với tham số 'appIdId' — giống cấu trúc mọi
+        action khác của DeveloperAPI này (list/add đều dùng plist qua
+        _make_developer_request), khác với certificates (dùng JSON v1 API).
+
+        CHỈ gọi hàm này với appIdId của App ID do CHÍNH TOOL NÀY tạo và
+        không còn app nào đang cài dùng nó — xem _resolve_app_id() trong
+        sideload_core.py, nơi quyết định app_id_id nào là "an toàn để xoá"
+        dựa trên registry cục bộ, KHÔNG xoá App ID ngẫu nhiên tìm thấy trên
+        tài khoản (App ID đó có thể đang được Xcode hoặc một app khác của
+        bạn trên thiết bị khác dùng).
+        """
+        print(f"[developer_api] Đang xoá App ID (appIdId={app_id_id}) để giải phóng hạn mức...")
+        try:
+            response = self._make_developer_request("ios/deleteAppId.action", extra_params={
+                "appIdId": app_id_id,
+            })
+            result_code = response.get("resultCode")
+            if result_code in (0, None):
+                print(f"[developer_api] ✅ Đã xoá App ID {app_id_id}.")
+                return True
+            print(f"[developer_api] Xoá App ID thất bại: {response}")
+            return False
+        except Exception as e:
+            print(f"[developer_api] Lỗi khi xoá App ID {app_id_id}: {e}")
+            return False
 
     # ─────────────────────────────────────────────────────────────────
     # Certificates — JSON v1 API
