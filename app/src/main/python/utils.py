@@ -40,10 +40,20 @@ def decode_apple_data_field(raw):
         return raw
     return base64.b64decode(raw)
 
-def run_command(command, cwd=None):
-    """Chạy lệnh shell và trả về output."""
+def run_command(command, cwd=None, extra_env=None):
+    """Chạy lệnh shell và trả về output.
+
+    extra_env: dict các biến môi trường THÊM VÀO (không thay thế) os.environ
+    hiện tại của tiến trình Python — dùng để set LD_LIBRARY_PATH khi chạy
+    zsign (xem sideload_core.py, bước "Ký IPA bằng zsign"), vì zsign cần tìm
+    libssl.so.3/libcrypto.so.3/libc++_shared.so đã giải nén sẵn ở một thư mục
+    KHÔNG nằm trong PATH tìm thư viện mặc định của Android."""
+    env = None
+    if extra_env:
+        env = dict(os.environ)
+        env.update(extra_env)
     try:
-        result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=True)
+        result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, check=True)
         print(f"[CMD] {command}\n{result.stdout}")
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:

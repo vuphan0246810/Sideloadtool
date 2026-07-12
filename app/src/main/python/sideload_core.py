@@ -645,7 +645,15 @@ def do_sideload(ipa_path: str, apple_id: str, password: str, udid_override: str 
             "-o", signed_ipa_path,
             app_bundle_path,
         ]
-        run_command(zsign_cmd)
+        # [FIX "CANNOT LINK EXECUTABLE ... library libssl.so.3 not found"]
+        # libzsign.so được build sẵn trong môi trường Termux nên phụ thuộc
+        # libssl.so.3/libcrypto.so.3/libc++_shared.so mà máy không cài Termux
+        # sẽ không có. AppPaths.nativeDepsDir() giải nén sẵn 3 file này (đóng
+        # gói trong assets/zsign_deps/) ra filesDir — set LD_LIBRARY_PATH trỏ
+        # vào đó để linker của tiến trình zsign tìm thấy chúng thay vì tìm
+        # (không thấy) đường dẫn Termux gốc. Xem chú thích chi tiết trong
+        # AppPaths.kt.
+        run_command(zsign_cmd, extra_env={"LD_LIBRARY_PATH": AppPaths.nativeDepsDir()})
 
         print("\n[Bước 5/6] Ghép nối với thiết bị (nếu chưa) — kiểm tra màn hình iPhone...")
         pair_record = _get_or_create_pair_record(udid)

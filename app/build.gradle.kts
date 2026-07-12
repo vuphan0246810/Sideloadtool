@@ -62,6 +62,17 @@ android {
             useLegacyPackaging = true
         }
     }
+
+    // libzsign.so (built for Termux) dynamically needs libssl.so.3/libcrypto.so.3/
+    // libc++_shared.so at runtime — see AppPaths.nativeDepsDir() for why these can't
+    // live in jniLibs/ like libzsign.so itself (their versioned filenames don't match
+    // the lib*.so pattern the installer extracts into nativeLibraryDir). They are
+    // shipped as plain assets instead and unpacked to filesDir at runtime, so force
+    // them to be stored uncompressed here — avoids relying on AAPT's default
+    // by-extension compression heuristics for an unusual extension like ".3".
+    androidResources {
+        noCompress += listOf("zsign_deps/libssl.so.3", "zsign_deps/libcrypto.so.3", "zsign_deps/libc++_shared.so")
+    }
 }
 
 chaquopy {
