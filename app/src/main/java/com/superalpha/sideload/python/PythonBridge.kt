@@ -45,7 +45,7 @@ object PythonBridge {
     suspend fun connectedUdid(): String? = withContext(Dispatchers.IO) {
         try {
             val result = core().callAttr("get_connected_udid")
-            if (result.isNone) null else result.toString()
+            if (result == null) null else result.toString()
         } catch (e: Exception) {
             null
         }
