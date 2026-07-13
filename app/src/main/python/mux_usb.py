@@ -304,10 +304,24 @@ class MuxDevice:
         return (protocol, length, tx_seq, rx_seq), payload
 
     def _pump_loop(self):
+        _consecutive_errors = 0
         while not self._stop.is_set():
             try:
                 header, payload = self._recv_raw(timeout_s=5.0)
+                _consecutive_errors = 0  # reset on success
             except MuxError:
+                # Không có dữ liệu trong 5s — bình thường khi đang chờ, không phải lỗi.
+                _consecutive_errors += 1
+                if _consecutive_errors >= 20:
+                    # 20 × 5s = 100s không có dữ liệu nào từ USB — thiết bị có thể đã
+                    # bị rút ra. Thông báo cho tất cả kết nối đang chờ để chúng không
+                    # phải đợi hết timeout (có thể tới 60s) mới biết USB đã chết.
+                    with self._io_lock:
+                        for conn in list(self._connections.values()):
+                            if not conn._closed.is_set():
+                                conn._rx_queue.put(b"")
+                                conn._closed.set()
+                    _consecutive_errors = 0
                 continue
             except Exception as e:
                 print(f"[mux] Lỗi vòng lặp đọc USB: {e}")

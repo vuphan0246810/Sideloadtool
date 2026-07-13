@@ -142,11 +142,30 @@ def _save_pair_record(record: dict):
         plistlib.dump(record, f)
 
 
+def delete_pair_record() -> bool:
+    """Xoá pair record đã lưu để buộc ghép nối lại từ đầu trong lần sideload
+    tiếp theo. Gọi từ Kotlin khi người dùng bấm 'Ghép nối lại iPhone'."""
+    path = _pair_record_path()
+    if os.path.exists(path):
+        os.remove(path)
+        print("[pairing] Đã xoá pair record cũ. Lần sideload tiếp theo sẽ ghép nối lại với iPhone.")
+        return True
+    print("[pairing] Không có pair record nào để xoá.")
+    return False
+
+
 def _get_or_create_pair_record(udid: str) -> dict:
     record = _load_pair_record()
     if record:
-        return record
-    print("[pairing] Chưa ghép nối với thiết bị này — bắt đầu ghép nối lần đầu...")
+        # Kiểm tra tính hợp lệ của record đã lưu trước khi dùng.
+        # Pair record từ lần trước có thể thiếu EscrowBag (ghép nối không
+        # hoàn chỉnh) hoặc thiếu cert/key (lỗi ghi đĩa) — phải ghép nối lại.
+        if device_link.validate_pair_record(record):
+            print("[pairing] ✅ Đã ghép nối trước đó — dùng lại pair record.")
+            return record
+        print("[pairing] Pair record cũ không hợp lệ — xoá và ghép nối lại...")
+        delete_pair_record()
+    print("[pairing] Bắt đầu ghép nối lần đầu với thiết bị...")
     record = device_link.pair_device(udid)
     _save_pair_record(record)
     return record
@@ -499,6 +518,11 @@ def _resolve_app_id(dev_api, state, app_ids, bundle_id, app_name, app_bundle_pat
 def do_sideload(ipa_path: str, apple_id: str, password: str, udid_override: str = "", anisette_url: str = "") -> bool:
     """Cổng vào chính cho tab "Sideload". Trả True/False cho PythonBridge.kt."""
     anisette_url = anisette_url or None
+    # Luôn reset MuxDevice singleton trước mỗi lần chạy để đảm bảo phiên USB
+    # mới hoàn toàn. Không reset thì: lần chạy thứ 2 sẽ dùng lại pump thread
+    # cũ → thiết bị đã bị rút/cắm lại nhưng code vẫn nghĩ đang ở giữa phiên
+    # cũ → giao thức mux bị lệch ngay từ đầu, mọi request đều bị drop im lặng.
+    device_link.reset_mux_device()
     try:
         print("\n=== Bắt đầu quá trình Sideload ===")
         state = _load_state()
@@ -655,8 +679,9 @@ def do_sideload(ipa_path: str, apple_id: str, password: str, udid_override: str 
         # AppPaths.kt.
         run_command(zsign_cmd, extra_env={"LD_LIBRARY_PATH": AppPaths.nativeDepsDir()})
 
-        print("\n[Bước 5/6] Ghép nối với thiết bị (nếu chưa)...")
+        print("\n[Bước 5/6] Ghép nối với thiết bị...")
         print("[pairing] Khi popup xuất hiện trên iPhone, hãy bấm 'Tin cậy' (Trust This Computer).")
+        print("[pairing] iPhone PHẢI còn sáng màn hình và chưa bị khoá trong bước này.")
         print("[pairing] Bạn có tối đa 60 giây để bấm Trust sau khi popup xuất hiện.")
         pair_record = _get_or_create_pair_record(udid)
 

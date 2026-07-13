@@ -76,9 +76,9 @@ class LockdownClient:
         self.device = get_device()
         self.conn = self.device.connect(LOCKDOWN_PORT)
 
-    def _request(self, request: dict) -> dict:
+    def _request(self, request: dict, timeout: float = 30.0) -> dict:
         _send_plist(self.conn, request)
-        response = _recv_plist(self.conn)
+        response = _recv_plist(self.conn, timeout=timeout)
         if response.get("Error"):
             raise LockdownError(f"lockdownd trả lỗi: {response.get('Error')}")
         return response
@@ -211,7 +211,18 @@ def _generate_host_identity(device_public_key_pem: bytes, device_version: str | 
         .sign(root_key, alg)
     )
 
-    device_public_key = load_pem_public_key(device_public_key_pem)
+    # Thử parse PEM trước (-----BEGIN RSA PUBLIC KEY----- hoặc BEGIN PUBLIC KEY);
+    # nếu thất bại, thử parse DER. lockdownd thường trả PEM nhưng một số phiên bản
+    # iOS trả DER binary — cần hỗ trợ cả hai để tránh ValueError crash.
+    from cryptography.hazmat.primitives.serialization import load_der_public_key
+    device_public_key = None
+    try:
+        device_public_key = load_pem_public_key(device_public_key_pem)
+    except (ValueError, TypeError, UnicodeDecodeError):
+        try:
+            device_public_key = load_der_public_key(device_public_key_pem)
+        except Exception as e2:
+            raise LockdownError(f"Không parse được DevicePublicKey (thử PEM và DER đều thất bại): {e2}")
     if not isinstance(device_public_key, RSAPublicKey):
         raise LockdownError("DevicePublicKey trả về từ thiết bị không phải khóa RSA hợp lệ.")
     device_cert = (
@@ -353,10 +364,18 @@ def pair_device(udid: str) -> dict:
                     "Bạn đã bấm 'Không tin cậy' (Don\'t Trust) trên iPhone.\n"
                     "Ngắt và cắm lại USB, rồi bấm 'Ký & Cài đặt' lại — lần này hãy bấm 'Tin cậy' (Trust)."
                 )
+            elif err == "PasswordProtected":
+                raise LockdownError(
+                    "iPhone đang bị khoá bằng mã PIN / mật khẩu.\n"
+                    "Hãy mở khoá màn hình iPhone (nhập mã PIN), sau đó thử lại."
+                )
             elif err == "InvalidHostID":
                 raise LockdownError(
-                    "Thiết bị báo InvalidHostID. Xoá file pair record cũ và thử lại."
+                    "Thiết bị báo InvalidHostID. Xoá pair record cũ (Settings → Xóa dữ liệu ghép nối) và thử lại."
                 )
+            elif err:
+                print(f"[pairing] lockdownd trả lỗi không xác định: {err!r} — phản hồi đầy đủ: {response}")
+                raise LockdownError(f"Pairing bị từ chối bởi thiết bị: {err}")
             break
 
         if response is None or (response.get("Result") != "Success" and "EscrowBag" not in response):
@@ -657,3 +676,36 @@ def afc_push_ipa(pair_record: dict, local_ipa_path: str, remote_filename: str, p
         return f"/{remote_path}"
     finally:
         afc.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tiện ích cho sideload_core.py
+# ─────────────────────────────────────────────────────────────────────────
+
+def reset_mux_device():
+    """Huỷ singleton MuxDevice hiện tại (dừng pump thread, đóng USB).
+    Phải gọi ở ĐẦU mỗi lần chạy do_sideload() để đảm bảo mỗi lần sideload
+    bắt đầu bằng một phiên USB hoàn toàn mới — không dùng lại pump thread
+    hoặc trạng thái TCP còn sót từ lần chạy trước (kể cả khi lần trước
+    thất bại hoặc iPhone đã bị rút cắm lại)."""
+    from mux_usb import reset_device as _mux_reset
+    _mux_reset()
+
+
+def validate_pair_record(pair_record: dict) -> bool:
+    """Kiểm tra nhanh pair record: đảm bảo các trường bắt buộc có mặt và
+    không rỗng. KHÔNG kết nối thiết bị — chỉ kiểm tra cấu trúc dict.
+    Trả True nếu record trông hợp lệ, False nếu bị thiếu trường hoặc rỗng."""
+    required_keys = ["HostID", "SystemBUID", "HostCertificate", "HostPrivateKey",
+                     "RootCertificate", "RootPrivateKey"]
+    for key in required_keys:
+        val = pair_record.get(key)
+        if not val:
+            print(f"[pairing] Pair record thiếu hoặc trống trường '{key}' — cần ghép nối lại.")
+            return False
+    # EscrowBag bắt buộc trên iOS 7+ — nếu không có, record được tạo từ
+    # một lần ghép nối không hoàn chỉnh (iOS chưa trả EscrowBag).
+    if not pair_record.get("EscrowBag"):
+        print("[pairing] Pair record không có EscrowBag (iOS 7+) — cần ghép nối lại.")
+        return False
+    return True
