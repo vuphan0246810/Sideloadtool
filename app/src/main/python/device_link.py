@@ -249,9 +249,9 @@ def _generate_host_identity(device_public_key_pem: bytes, device_version: str | 
         return cert_or_key.public_bytes(serialization.Encoding.PEM)
 
     def der(cert):
-        """DER (binary) — lockdownd kỳ vọng format này trong PairRecord.
-        PEM text (-----BEGIN CERTIFICATE-----) bị lockdownd từ chối im lặng,
-        Trust popup không xuất hiện trên iPhone (lỗi gốc)."""
+        """DER (binary) — KHÔNG dùng trong PairRecord gửi cho lockdownd.
+        Chỉ giữ lại để phòng trường hợp cần sau này (vd: kiểm tra cert).
+        PairRecord gửi đi phải dùng PEM (xem bình luận ở request bên dưới)."""
         return cert.public_bytes(serialization.Encoding.DER)
 
     return {
@@ -315,17 +315,23 @@ def pair_device(udid: str) -> dict:
             "HostPrivateKey": identity["host_key_pem"],
         }
 
-        # PairRecord gửi lên thiết bị PHẢI dùng DER (binary), KHÔNG dùng PEM.
-        # lockdownd parse DER certificate natively — PEM text (ASCII với header
-        # -----BEGIN CERTIFICATE-----) bị từ chối im lặng, Trust popup sẽ không
-        # xuất hiện trên iPhone (đây là lỗi gốc gây "không thấy popup Trust").
+        # PairRecord gửi lên thiết bị PHẢI dùng PEM (ASCII text), không phải DER.
+        # Bằng chứng:
+        #   - libimobiledevice lockdown.c hàm lockdownd_pair_record_to_plist():
+        #     plist_new_data(pair_record->device_certificate, strlen(cert))
+        #     strlen() chỉ đúng với PEM (chuỗi ASCII kết thúc bằng '\0') — DER
+        #     là binary, strlen() sẽ dừng sớm ở byte 0x00 đầu tiên → sai hoàn toàn.
+        #   - pymobiledevice3 ca.py generate_pairing_cert_chain():
+        #     trả về serialize_cert_pem(cert) — PEM cho mọi trường cert.
+        # Session-1 đổi sang DER là NHẦM: Trust popup không hiện vì lockdownd
+        # nhận được DER thay vì PEM mà nó kỳ vọng.
         request = {
             "Request": "Pair",
             "Label": "SuperAlphaSideload",
             "PairRecord": {
-                "DeviceCertificate": identity["device_cert_der"],
-                "HostCertificate": identity["host_cert_der"],
-                "RootCertificate": identity["root_cert_der"],
+                "DeviceCertificate": identity["device_cert_pem"],
+                "HostCertificate": identity["host_cert_pem"],
+                "RootCertificate": identity["root_cert_pem"],
                 "HostID": host_id,
                 "SystemBUID": system_buid,
             },

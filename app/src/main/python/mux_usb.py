@@ -234,6 +234,22 @@ class MuxDevice:
         self._stop = threading.Event()
 
     def start(self):
+        # Xả sạch bộ đệm nhận USB trước khi gửi version request.
+        # Nếu phiên trước để lại dữ liệu chưa đọc trong hardware buffer,
+        # _recv_raw() sẽ đọc rác thay vì version reply → MuxError.
+        # Đọc tất cả dữ liệu pending với timeout ngắn (100ms) và bỏ qua.
+        _flush_count = 0
+        while True:
+            try:
+                stale = self._io._transport.bulkRead(100)
+                if stale is None:
+                    break
+                _flush_count += len(bytes(stale))
+            except Exception:
+                break
+        if _flush_count:
+            print(f"[mux] Đã xả {_flush_count} byte dữ liệu cũ trong bộ đệm USB.")
+
         print("[mux] Bắt tay phiên bản usbmux qua USB (header ngắn 8 byte)...")
         version_payload = struct.pack(_VERSION_HDR_FMT, VERSION_MAJOR, VERSION_MINOR, 0)
         self._send_raw(MUX_PROTO_VERSION, version_payload)
@@ -316,11 +332,12 @@ class MuxDevice:
                     # 20 × 5s = 100s không có dữ liệu nào từ USB — thiết bị có thể đã
                     # bị rút ra. Thông báo cho tất cả kết nối đang chờ để chúng không
                     # phải đợi hết timeout (có thể tới 60s) mới biết USB đã chết.
-                    with self._io_lock:
-                        for conn in list(self._connections.values()):
-                            if not conn._closed.is_set():
-                                conn._rx_queue.put(b"")
-                                conn._closed.set()
+                    # KHÔNG dùng _io_lock ở đây — _io_lock chỉ serialize USB write,
+                    # không bảo vệ _connections dict. Dùng list() snapshot là đủ.
+                    for conn in list(self._connections.values()):
+                        if not conn._closed.is_set():
+                            conn._rx_queue.put(b"")
+                            conn._closed.set()
                     _consecutive_errors = 0
                 continue
             except Exception as e:
@@ -402,8 +419,22 @@ def get_device() -> MuxDevice:
 
 
 def reset_device():
+    """Huỷ singleton MuxDevice hiện tại một cách an toàn.
+    Quan trọng: phải join() pump thread trước khi clear singleton — nếu không,
+    pump thread cũ vẫn đang gọi bulkRead() trong khi MuxDevice.start() mới
+    cũng gọi _io.read_exact() / bulkRead() → race condition trên
+    UsbTransport.bulkTransfer() → hành vi không xác định."""
     global _device_singleton
+    old = None
     with _device_lock:
         if _device_singleton is not None:
-            _device_singleton.stop()
+            old = _device_singleton
+            old.stop()
         _device_singleton = None
+    # join() ngoài _device_lock để tránh deadlock nếu pump thread cũng cố
+    # acquire _device_lock (hiện tại không có, nhưng an toàn hơn).
+    if old is not None and old._pump_thread is not None:
+        old._pump_thread.join(timeout=6.0)
+        if old._pump_thread.is_alive():
+            print("[mux] Cảnh báo: pump thread cũ không thoát trong 6s — tiếp tục.")
+    print("[mux] Đã reset MuxDevice singleton.")
