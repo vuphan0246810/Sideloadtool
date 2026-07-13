@@ -74,7 +74,15 @@ class LockdownClient:
 
     def __init__(self):
         self.device = get_device()
+        # [FIX chẩn đoán] Đây là điểm gọi self.device.connect() ĐẦU TIÊN sau khi
+        # bắt tay phiên bản mux thành công — chính là khoảng "im lặng" mà người
+        # dùng báo cáo (log dừng ở dòng chấp nhận phiên bản, không có gì tiếp
+        # theo, kể cả khi Trust popup không xuất hiện). In rõ đang mở kết nối gì
+        # để log không còn trống trong lúc chờ SYN-ACK/khi trust dialog hiện ra
+        # trên máy — connect()/wait_connected() bên dưới đã tự in tiến độ chờ.
+        print(f"[lockdown] Đang mở kết nối lockdownd (cổng {LOCKDOWN_PORT})...")
         self.conn = self.device.connect(LOCKDOWN_PORT)
+        print("[lockdown] ✅ Đã kết nối lockdownd.")
 
     def _request(self, request: dict, timeout: float = 30.0) -> dict:
         _send_plist(self.conn, request)
@@ -280,9 +288,11 @@ def pair_device(udid: str) -> dict:
     DevicePublicKey (bản cũ gửi sai khóa này), không có private key nào."""
     lockdown = LockdownClient()
     try:
+        print("[pairing] Đang lấy DevicePublicKey từ lockdownd...")
         device_public_key_response = lockdown.get_value(key="DevicePublicKey")
         if not device_public_key_response:
             raise LockdownError("Không lấy được DevicePublicKey — thiết bị có thể yêu cầu pairing khác quy trình chuẩn.")
+        print("[pairing] Đã có DevicePublicKey — đang tạo chuỗi chứng chỉ host...")
 
         device_version = None
         try:
