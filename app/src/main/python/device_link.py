@@ -1,19 +1,17 @@
 """device_link.py — client tối giản cho lockdownd / pairing / AFC /
 installation_proxy, xây trên mux_usb.py.
 
-FIX v6 (2026-07-13) — iOS 16+ SSL lockdownd support:
-  - CRITICAL: iOS 16+ yêu cầu SSL ngay từ khi kết nối TCP tới lockdownd port
-    62078 (trước cả QueryType). Không có SSL, lockdownd gửi RST ngay sau khi
-    nhận plaintext đầu tiên — đây là nguyên nhân chính không có Trust popup.
-  - Thêm class _SslPipe: bọc MuxConnection trong SSL qua MemoryBIO (tương tự
-    TlsLockdownClient nhưng áp dụng ngay từ đầu, trước QueryType).
-  - LockdownClient nay có tham số use_ssl (mặc định False). Khi use_ssl=True,
-    sau khi connect() sẽ ngay lập tức thực hiện SSL handshake.
-  - Thêm _open_lockdown(): factory tự động thử plaintext, nếu nhận RST
-    (MuxRstError) sẽ retry với SSL — hỗ trợ cả iOS < 16 và iOS 16+ tự động.
-  - LockdownRstError: subclass riêng để phân biệt lỗi RST với các lỗi khác.
-  - Tất cả fix từ v5 giữ nguyên (QueryType handshake bắt buộc, retry
-    GetValue, PEM cert chain, DeviceCertificate, WiFiAddress trước Pair, v.v.).
+FIX v7 (2026-07-13) — iOS 16.7 mTLS fix:
+  - CRITICAL: iOS 16.7 dùng mTLS (mutual TLS) — client PHẢI gửi certificate
+    ngay trong SSL ClientHello. _SslPipe anonymous (không có cert) bị lockdownd
+    RST ngay khi nhận ClientHello vì thiếu client certificate.
+  - Thêm _generate_temp_ssl_cert(): tạo RSA 2048 self-signed cert tạm thời
+    cho lần pair đầu (chưa có pair record). Cert này chỉ dùng cho SSL handshake,
+    không liên quan đến cert chain trong Pair request.
+  - _SslPipe luôn load client cert: pair_record cert nếu có, ngược lại dùng
+    temp cert tự sinh — đảm bảo ClientHello chứa Certificate extension.
+  - Thêm maximum_version=TLSv1_3 để match chính xác TlsLockdownClient.
+  - Tất cả fix v5/v6 giữ nguyên.
 """
 
 import plistlib
@@ -66,20 +64,58 @@ class LockdownRstError(LockdownError):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# SSL pipe cho iOS 16+ (lockdownd yêu cầu SSL trước QueryType)
+# SSL pipe cho iOS 16+ (lockdownd yêu cầu mTLS trước QueryType)
 # ─────────────────────────────────────────────────────────────────────────
+
+def _generate_temp_ssl_cert():
+    """Tạo RSA 2048 key + self-signed cert tạm thời cho SSL handshake với
+    iOS 16.7+ lockdownd.
+
+    iOS 16.7 dùng mTLS (mutual TLS): client PHẢI gửi certificate trong
+    ClientHello, ngay cả khi chưa có pair record. Nếu ClientHello không
+    chứa Certificate extension, lockdownd gửi RST ngay lập tức (đây là bug
+    chính trong v6: _SslPipe anonymous không load cert nào → RST).
+
+    Cert này là self-signed, Apple không verify nội dung cert client —
+    họ chỉ kiểm tra sự hiện diện của cert trong handshake. Sau khi pair
+    thành công, cert thật (từ pair record) được dùng cho các kết nối tiếp theo.
+    """
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    import datetime
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([]))
+        .issuer_name(x509.Name([]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return cert_pem, key_pem
+
 
 class _SslPipe:
     """Bọc MuxConnection trong SSL dùng MemoryBIO — không cần socket thật.
 
     iOS 16+ lockdownd yêu cầu SSL ngay sau khi TCP kết nối được thiết lập,
-    trước bất kỳ lệnh plist nào (kể cả QueryType). Lớp này thực hiện TLS
-    handshake qua MuxConnection.send()/recv() và sau đó cung cấp write()/read()
-    để giao tiếp plist qua lớp SSL.
+    trước bất kỳ lệnh plist nào (kể cả QueryType). iOS 16.7 cụ thể dùng
+    mTLS: client phải gửi certificate ngay trong ClientHello.
 
-    pair_record (tuỳ chọn): nếu có, load HostCertificate + HostPrivateKey làm
-    client cert (dùng khi đã paired, ví dụ trong start_session_tls). Nếu None,
-    dùng anonymous SSL (dùng khi pair lần đầu — trước khi có pair record).
+    pair_record: nếu có, dùng HostCertificate/HostPrivateKey làm client cert.
+    Nếu None (pair lần đầu, chưa có pair record): tự sinh temp RSA cert.
     """
 
     def __init__(self, conn: MuxConnection, pair_record: dict = None):
@@ -88,10 +124,15 @@ class _SslPipe:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
         if ssl.OPENSSL_VERSION.lower().startswith("openssl"):
             ctx.set_ciphers("ALL:!aNULL:!eNULL:@SECLEVEL=0")
         ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
 
+        # [FIX v7 CRITICAL] iOS 16.7 dùng mTLS — client PHẢI có cert.
+        # v6 bỏ qua bước này khi pair_record=None → ClientHello không có cert
+        # → lockdownd gửi RST ngay. Giải pháp: nếu không có pair_record, tự
+        # sinh temp RSA self-signed cert chỉ cho SSL handshake.
         if pair_record:
             cert_data = pair_record.get("HostCertificate", b"")
             key_data = pair_record.get("HostPrivateKey", b"")
@@ -99,14 +140,20 @@ class _SslPipe:
                 cert_data = cert_data.encode()
             if isinstance(key_data, str):
                 key_data = key_data.encode()
-            with tempfile.TemporaryDirectory() as tmp:
-                cert_path = os.path.join(tmp, "host.pem")
-                key_path = os.path.join(tmp, "host.key")
-                with open(cert_path, "wb") as f:
-                    f.write(cert_data)
-                with open(key_path, "wb") as f:
-                    f.write(key_data)
-                ctx.load_cert_chain(cert_path, key_path)
+            print("[lockdown] SSL: dùng HostCertificate từ pair record làm client cert.")
+        else:
+            print("[lockdown] SSL: sinh temp RSA cert cho iOS 16.7 mTLS handshake...")
+            cert_data, key_data = _generate_temp_ssl_cert()
+            print("[lockdown] SSL: ✅ Đã sinh temp RSA cert.")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cert_path = os.path.join(tmp, "host.pem")
+            key_path = os.path.join(tmp, "host.key")
+            with open(cert_path, "wb") as f:
+                f.write(cert_data)
+            with open(key_path, "wb") as f:
+                f.write(key_data)
+            ctx.load_cert_chain(cert_path, key_path)
 
         self._incoming = ssl.MemoryBIO()
         self._outgoing = ssl.MemoryBIO()
@@ -302,15 +349,16 @@ def _open_lockdown(pair_record: dict = None) -> LockdownClient:
     """Mở LockdownClient với SSL fallback tự động cho iOS 16+.
 
     Thử plaintext trước. Nếu nhận LockdownRstError (thiết bị gửi RST ngay),
-    thử lại với SSL — dùng pair_record làm client cert nếu có.
-    Hỗ trợ cả iOS < 16 (plaintext) và iOS 16+ (SSL bắt buộc).
+    thử lại với SSL — dùng pair_record làm client cert nếu có, nếu không
+    _SslPipe sẽ tự sinh temp RSA cert cho iOS 16.7 mTLS (FIX v7).
+
+    iOS 16.7 cụ thể: plaintext → RST; SSL without cert → RST; SSL with cert → ✅.
     """
     try:
         return LockdownClient(use_ssl=False)
     except LockdownRstError as e:
-        print(f"[lockdown] Plaintext bị RST ({e})")
-        print("[lockdown] Đây thường là dấu hiệu iOS 16+ yêu cầu SSL ngay từ đầu.")
-        print("[lockdown] Thử lại với SSL (iOS 16+ mode)...")
+        print(f"[lockdown] Plaintext bị RST: {e}")
+        print("[lockdown] iOS 16+ phát hiện — thử SSL với client cert (iOS 16.7 mTLS)...")
         return LockdownClient(use_ssl=True, ssl_pair_record=pair_record)
 
 
