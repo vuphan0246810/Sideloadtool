@@ -1,31 +1,30 @@
 """device_link.py — client tối giản cho lockdownd / pairing / AFC /
 installation_proxy, xây trên mux_usb.py.
 
-Thay thế các lệnh shellout `idevice_id` / `ideviceinstaller` (libimobiledevice,
-không có sẵn trên Android) của bản Termux gốc bằng cách tự nói chuyện với
-iPhone qua giao thức lockdown thật. Cũng CHƯA được kiểm chứng trên phần cứng
-thật — xem cảnh báo ở đầu mux_usb.py, áp dụng tương tự cho toàn bộ file này.
-
-Các phần triển khai, xếp theo độ tin cậy (dựa trên tài liệu công khai):
-  - Lockdown QueryType / GetValue / StartService: định dạng bản tin là plist
-    XML có tiền tố 4-byte big-endian độ dài — được ghi lại rộng rãi trong
-    nhiều dự án mã nguồn mở độc lập, độ tin cậy cao.
-  - Pairing (trao đổi certificate) + StartSession + nâng cấp TLS: định dạng
-    plist các trường (DeviceCertificate/HostCertificate/RootCertificate/...)
-    cũng được ghi lại công khai (độ tin cậy trung bình-cao), nhưng phần bọc
-    TLS qua ssl.MemoryBIO bơm tay từng byte qua mux_usb là phần tự ráp nối,
-    ĐỘ TIN CẬY THẤP HƠN — nhiều khả năng cần chỉnh sửa khi test thật.
-  - AFC (đẩy file lên /PublicStaging) và installation_proxy (Install): định
-    dạng gói tin cũng là tài liệu công khai, độ tin cậy trung bình.
+FIX v6 (2026-07-13) — iOS 16+ SSL lockdownd support:
+  - CRITICAL: iOS 16+ yêu cầu SSL ngay từ khi kết nối TCP tới lockdownd port
+    62078 (trước cả QueryType). Không có SSL, lockdownd gửi RST ngay sau khi
+    nhận plaintext đầu tiên — đây là nguyên nhân chính không có Trust popup.
+  - Thêm class _SslPipe: bọc MuxConnection trong SSL qua MemoryBIO (tương tự
+    TlsLockdownClient nhưng áp dụng ngay từ đầu, trước QueryType).
+  - LockdownClient nay có tham số use_ssl (mặc định False). Khi use_ssl=True,
+    sau khi connect() sẽ ngay lập tức thực hiện SSL handshake.
+  - Thêm _open_lockdown(): factory tự động thử plaintext, nếu nhận RST
+    (MuxRstError) sẽ retry với SSL — hỗ trợ cả iOS < 16 và iOS 16+ tự động.
+  - LockdownRstError: subclass riêng để phân biệt lỗi RST với các lỗi khác.
+  - Tất cả fix từ v5 giữ nguyên (QueryType handshake bắt buộc, retry
+    GetValue, PEM cert chain, DeviceCertificate, WiFiAddress trước Pair, v.v.).
 """
 
 import plistlib
 import ssl
 import struct
+import tempfile
+import os
 import time
 import uuid
 
-from mux_usb import get_device, MuxConnection
+from mux_usb import get_device, MuxConnection, MuxError, MuxRstError
 
 LOCKDOWN_PORT = 62078
 
@@ -35,13 +34,7 @@ LOCKDOWN_PORT = 62078
 # ─────────────────────────────────────────────────────────────────────────
 
 def get_udid_from_usb():
-    """Đọc UDID trực tiếp từ USB serial descriptor của thiết bị — không cần
-    mở kết nối mux/lockdown nào cả. Hầu hết iPhone/iPad trả về đúng UDID 40
-    ký tự (hoặc 24+16 ký tự có dấu gạch ngang trên các model mới) ở đây."""
-    # Không có Context trực tiếp trong Python; UDID thật sự được cung cấp
-    # qua sideload_core.set_current_udid() khi Kotlin mở kết nối USB (xem
-    # SideloadScreen/UsbPermissionManager — UsbDevice.serialNumber đọc ở đó,
-    # nơi có sẵn Context, rồi truyền UDID sang Python một lần).
+    """Đọc UDID đã được set qua sideload_core.set_current_udid()."""
     import sideload_core
     return sideload_core.get_cached_udid()
 
@@ -66,60 +59,207 @@ class LockdownError(Exception):
     pass
 
 
-class LockdownClient:
-    """Kết nối lockdown cơ bản (không TLS) — đủ cho QueryType/GetValue/
-    StartService trên nhiều phiên bản iOS. Một số phiên bản iOS mới hơn có
-    thể yêu cầu StartSession (TLS) trước khi cho phép GetValue/StartService
-    — nếu gặp lỗi permission, hãy thử pair()+start_session() trước."""
+class LockdownRstError(LockdownError):
+    """Thiết bị gửi RST khi nhận plaintext lockdownd — thường là iOS 16+
+    yêu cầu SSL ngay từ đầu. Caller nên retry với use_ssl=True."""
+    pass
 
-    def __init__(self):
+
+# ─────────────────────────────────────────────────────────────────────────
+# SSL pipe cho iOS 16+ (lockdownd yêu cầu SSL trước QueryType)
+# ─────────────────────────────────────────────────────────────────────────
+
+class _SslPipe:
+    """Bọc MuxConnection trong SSL dùng MemoryBIO — không cần socket thật.
+
+    iOS 16+ lockdownd yêu cầu SSL ngay sau khi TCP kết nối được thiết lập,
+    trước bất kỳ lệnh plist nào (kể cả QueryType). Lớp này thực hiện TLS
+    handshake qua MuxConnection.send()/recv() và sau đó cung cấp write()/read()
+    để giao tiếp plist qua lớp SSL.
+
+    pair_record (tuỳ chọn): nếu có, load HostCertificate + HostPrivateKey làm
+    client cert (dùng khi đã paired, ví dụ trong start_session_tls). Nếu None,
+    dùng anonymous SSL (dùng khi pair lần đầu — trước khi có pair record).
+    """
+
+    def __init__(self, conn: MuxConnection, pair_record: dict = None):
+        self.conn = conn
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        if ssl.OPENSSL_VERSION.lower().startswith("openssl"):
+            ctx.set_ciphers("ALL:!aNULL:!eNULL:@SECLEVEL=0")
+        ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+
+        if pair_record:
+            cert_data = pair_record.get("HostCertificate", b"")
+            key_data = pair_record.get("HostPrivateKey", b"")
+            if isinstance(cert_data, str):
+                cert_data = cert_data.encode()
+            if isinstance(key_data, str):
+                key_data = key_data.encode()
+            with tempfile.TemporaryDirectory() as tmp:
+                cert_path = os.path.join(tmp, "host.pem")
+                key_path = os.path.join(tmp, "host.key")
+                with open(cert_path, "wb") as f:
+                    f.write(cert_data)
+                with open(key_path, "wb") as f:
+                    f.write(key_data)
+                ctx.load_cert_chain(cert_path, key_path)
+
+        self._incoming = ssl.MemoryBIO()
+        self._outgoing = ssl.MemoryBIO()
+        self._ssl_obj = ctx.wrap_bio(self._incoming, self._outgoing, server_hostname=None)
+        self._do_handshake()
+
+    def _flush_outgoing(self):
+        """Gửi tất cả dữ liệu TLS outgoing (ClientHello, data, v.v.) qua MuxConnection."""
+        out = self._outgoing.read()
+        if out:
+            self.conn.send(out)
+
+    def _do_handshake(self):
+        """Thực hiện TLS handshake bằng cách bơm tay dữ liệu qua MuxConnection."""
+        print("[lockdown] Đang thực hiện TLS handshake với lockdownd (iOS 16+)...")
+        for attempt in range(30):
+            try:
+                self._ssl_obj.do_handshake()
+                # Handshake hoàn tất — flush dữ liệu cuối cùng (Finished message)
+                self._flush_outgoing()
+                print("[lockdown] ✅ TLS handshake với lockdownd thành công (iOS 16+ mode).")
+                return
+            except ssl.SSLWantReadError:
+                self._flush_outgoing()
+                try:
+                    raw = self.conn.recv(4096, timeout=10.0)
+                    if raw:
+                        self._incoming.write(raw)
+                except MuxRstError as e:
+                    raise LockdownRstError(f"Thiết bị gửi RST trong TLS handshake: {e}")
+                except MuxError as e:
+                    raise LockdownError(f"Lỗi kết nối trong TLS handshake: {e}")
+            except ssl.SSLError as e:
+                raise LockdownError(f"TLS handshake thất bại: {e}")
+        raise LockdownError("TLS handshake với lockdownd không hoàn tất sau nhiều lần thử.")
+
+    def write(self, data: bytes):
+        """Mã hoá và gửi data qua SSL → MuxConnection."""
+        self._ssl_obj.write(data)
+        self._flush_outgoing()
+
+    def read(self, size: int, timeout=30.0) -> bytes:
+        """Đọc và giải mã đúng size byte từ MuxConnection → SSL."""
+        buf = b""
+        deadline = time.time() + timeout
+        while len(buf) < size:
+            # Thử đọc từ decrypt buffer SSL trước
+            try:
+                chunk = self._ssl_obj.read(size - len(buf))
+                if chunk:
+                    buf += chunk
+                    continue
+            except ssl.SSLWantReadError:
+                pass
+            # Cần thêm dữ liệu từ mạng
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise LockdownError(f"Timeout khi đọc {size} byte qua SSL từ lockdownd.")
+            try:
+                raw = self.conn.recv(4096, timeout=min(10.0, remaining))
+                if raw:
+                    self._incoming.write(raw)
+            except MuxRstError as e:
+                raise LockdownRstError(f"Kết nối SSL bị RST: {e}")
+            except MuxError as e:
+                raise LockdownError(f"Lỗi đọc qua SSL: {e}")
+        return buf
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# LockdownClient
+# ─────────────────────────────────────────────────────────────────────────
+
+class LockdownClient:
+    """Kết nối lockdown — hỗ trợ cả plaintext (iOS < 16) và SSL (iOS 16+).
+
+    use_ssl=False (mặc định): plaintext plist — hoạt động với iOS < 16.
+    use_ssl=True: bọc MuxConnection trong SSL ngay sau khi TCP kết nối —
+        bắt buộc cho iOS 16+ (lockdownd gửi RST nếu nhận plaintext).
+
+    ssl_pair_record: pair record đã lưu để làm client cert trong SSL handshake.
+        Có thể None nếu chưa paired (dùng anonymous SSL lần đầu).
+    """
+
+    def __init__(self, use_ssl: bool = False, ssl_pair_record: dict = None):
         self.device = get_device()
-        # [FIX chẩn đoán] Đây là điểm gọi self.device.connect() ĐẦU TIÊN sau khi
-        # bắt tay phiên bản mux thành công — chính là khoảng "im lặng" mà người
-        # dùng báo cáo (log dừng ở dòng chấp nhận phiên bản, không có gì tiếp
-        # theo, kể cả khi Trust popup không xuất hiện). In rõ đang mở kết nối gì
-        # để log không còn trống trong lúc chờ SYN-ACK/khi trust dialog hiện ra
-        # trên máy — connect()/wait_connected() bên dưới đã tự in tiến độ chờ.
-        print(f"[lockdown] Đang mở kết nối lockdownd (cổng {LOCKDOWN_PORT})...")
+        ssl_label = " (SSL/iOS 16+)" if use_ssl else ""
+        print(f"[lockdown] Đang mở kết nối lockdownd{ssl_label} (cổng {LOCKDOWN_PORT})...")
         self.conn = self.device.connect(LOCKDOWN_PORT)
-        print("[lockdown] ✅ Đã kết nối lockdownd.")
-        # ════════════════════════════════════════════════════════════════
-        # FIX CRITICAL (v5): Gửi QueryType làm handshake đầu tiên.
-        #
-        # ĐÂY LÀ NGUYÊN NHÂN CHÍNH khiến popup "Trust This Computer"
-        # KHÔNG BAO GIỜ xuất hiện trên màn hình iPhone:
-        #
-        #   - libimobiledevice lockdown.c: lockdownd_client_new_with_handshake()
-        #     gọi lockdownd_query_type() TRƯỚC tất cả mọi lệnh khác.
-        #   - pymobiledevice3 lockdown.py: LockdownClient.__init__() gọi
-        #     self.query_type() ngay sau khi kết nối.
-        #   - iOS 14+: nếu không có QueryType đầu tiên, lockdownd sẽ im
-        #     lặng bỏ qua GetValue / Pair (không trả lỗi, không phản hồi
-        #     → timeout 30s). Không có GetValue → không có Pair → không có
-        #     Trust popup. Đây đúng là triệu chứng người dùng báo cáo.
-        #
-        # Ghi chú: dùng _request_raw() (không check trường "Error") để
-        # tránh vòng lặp đệ quy — LockdownError từ QueryType không nên
-        # gọi lại __init__().
-        # ════════════════════════════════════════════════════════════════
+        print(f"[lockdown] ✅ Đã kết nối lockdownd{ssl_label}.")
+
+        self._ssl_pipe: _SslPipe | None = None
+        if use_ssl:
+            try:
+                self._ssl_pipe = _SslPipe(self.conn, ssl_pair_record)
+            except LockdownRstError:
+                raise
+            except LockdownError:
+                raise
+            except Exception as e:
+                raise LockdownError(f"Không thiết lập được SSL cho lockdownd: {e}")
+
+        # QueryType — bắt buộc phải gửi làm lệnh đầu tiên (iOS 14+).
+        # libimobiledevice lockdown.c: lockdownd_client_new_with_handshake()
+        # pymobiledevice3 lockdown.py: LockdownClient.__init__() → query_type()
+        # Nếu thiếu QueryType, lockdownd iOS 14+ im lặng bỏ qua GetValue/Pair
+        # → Trust popup không bao giờ xuất hiện.
         try:
-            qt_resp = self._request_raw({"Request": "QueryType", "Label": "SuperAlphaSideload"}, timeout=10.0)
+            qt_resp = self._request_raw(
+                {"Request": "QueryType", "Label": "SuperAlphaSideload"},
+                timeout=10.0,
+            )
             svc_type = qt_resp.get("Type", "?")
             print(f"[lockdown] QueryType OK — dịch vụ: {svc_type}")
+        except LockdownRstError:
+            # RST ngay khi gửi QueryType → iOS 16+ cần SSL nhưng đang chạy
+            # plaintext (use_ssl=False). Re-raise để _open_lockdown() retry SSL.
+            raise
         except Exception as _qt_err:
-            # Thiết bị rất cũ (iOS < 5) không có QueryType — không fail toàn bộ.
-            print(f"[lockdown] Cảnh báo QueryType: {_qt_err} — tiếp tục các lệnh khác...")
+            # Thiết bị cũ (iOS < 5) không có QueryType — không fail toàn bộ.
+            print(f"[lockdown] Cảnh báo QueryType: {_qt_err} — tiếp tục...")
 
-    def _request_raw(self, request: dict, timeout: float = 30.0) -> dict:
-        """Gửi + nhận plist thuần tuý, KHÔNG kiểm tra trường Error.
-        Dùng nội bộ cho QueryType và các lệnh pair bước đầu để tránh
-        vòng lặp đệ quy nếu lockdownd trả Error ở chính các bước này."""
-        _send_plist(self.conn, request)
+    # ── Gửi/nhận plist (tự động dùng SSL nếu _ssl_pipe có mặt) ──────────
+
+    def _send_plist_enc(self, obj: dict):
+        payload = plistlib.dumps(obj, fmt=plistlib.FMT_XML)
+        framed = struct.pack(">I", len(payload)) + payload
+        if self._ssl_pipe:
+            self._ssl_pipe.write(framed)
+        else:
+            self.conn.send(framed)
+
+    def _recv_plist_enc(self, timeout: float = 15.0) -> dict:
+        if self._ssl_pipe:
+            length_bytes = self._ssl_pipe.read(4, timeout=timeout)
+            (length,) = struct.unpack(">I", length_bytes)
+            payload = self._ssl_pipe.read(length, timeout=timeout)
+            return plistlib.loads(payload)
         return _recv_plist(self.conn, timeout=timeout)
 
+    def _request_raw(self, request: dict, timeout: float = 30.0) -> dict:
+        """Gửi + nhận plist, KHÔNG kiểm tra trường Error.
+        Dùng nội bộ cho QueryType và pair đầu tiên."""
+        try:
+            self._send_plist_enc(request)
+            return self._recv_plist_enc(timeout=timeout)
+        except MuxRstError as e:
+            raise LockdownRstError(
+                f"Thiết bị gửi RST (kết nối bị đóng) — có thể cần SSL (iOS 16+): {e}"
+            )
+
     def _request(self, request: dict, timeout: float = 30.0) -> dict:
-        _send_plist(self.conn, request)
-        response = _recv_plist(self.conn, timeout=timeout)
+        response = self._request_raw(request, timeout=timeout)
         if response.get("Error"):
             raise LockdownError(f"lockdownd trả lỗi: {response.get('Error')}")
         return response
@@ -137,9 +277,6 @@ class LockdownClient:
         return response.get("Value")
 
     def start_service(self, service_name: str) -> dict:
-        """Yêu cầu lockdownd khởi động một dịch vụ (vd
-        com.apple.mobile.installation_proxy) và trả về cổng TCP ảo mới để
-        kết nối tới dịch vụ đó."""
         response = self._request({
             "Request": "StartService",
             "Service": service_name,
@@ -158,19 +295,31 @@ class LockdownClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Pairing — cần thiết cho AFC / installation_proxy trên phần lớn phiên bản
-# iOS. Người dùng phải bấm "Trust" (Tin cậy) trên màn hình iPhone khi được
-# hỏi lần đầu — hành vi này giống hệt khi cắm iPhone vào máy Mac/PC lần đầu.
+# Factory: tự động retry với SSL nếu plaintext bị RST (iOS 16+)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _open_lockdown(pair_record: dict = None) -> LockdownClient:
+    """Mở LockdownClient với SSL fallback tự động cho iOS 16+.
+
+    Thử plaintext trước. Nếu nhận LockdownRstError (thiết bị gửi RST ngay),
+    thử lại với SSL — dùng pair_record làm client cert nếu có.
+    Hỗ trợ cả iOS < 16 (plaintext) và iOS 16+ (SSL bắt buộc).
+    """
+    try:
+        return LockdownClient(use_ssl=False)
+    except LockdownRstError as e:
+        print(f"[lockdown] Plaintext bị RST ({e})")
+        print("[lockdown] Đây thường là dấu hiệu iOS 16+ yêu cầu SSL ngay từ đầu.")
+        print("[lockdown] Thử lại với SSL (iOS 16+ mode)...")
+        return LockdownClient(use_ssl=True, ssl_pair_record=pair_record)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pairing
 # ─────────────────────────────────────────────────────────────────────────
 
 def _select_hash_algorithm(device_version: str | None):
-    """Chọn thuật toán băm để ký chuỗi chứng chỉ pairing — khớp hành vi thật
-    của lockdownd/idevicepair: SHA-1 cho thiết bị iOS < 4.0.0 (rất hiếm gặp
-    ngày nay), SHA-256 cho mọi phiên bản còn lại. Xem
-    common/userpref.c::pair_record_generate_keys_and_certs trong
-    libimobiledevice."""
     from cryptography.hazmat.primitives import hashes
-
     if not device_version:
         return hashes.SHA256()
     try:
@@ -181,31 +330,14 @@ def _select_hash_algorithm(device_version: str | None):
 
 
 def _generate_host_identity(device_public_key_pem: bytes, device_version: str | None = None):
-    """Sinh chuỗi chứng chỉ Root CA (tự ký) -> Host cert -> **Device cert**
-    dùng cho pairing, khớp CHÍNH XÁC cấu trúc mà lockdownd thật kỳ vọng
-    (đối chiếu trực tiếp với common/userpref.c của libimobiledevice và với
-    pymobiledevice3/ca.py — hai cách triển khai độc lập, cùng logic):
-
-      - Root CA: subject/issuer RỖNG (x509.Name([])), serial=1, tự ký,
-        BasicConstraints CA:TRUE (critical).
-      - Host cert (lá): subject rỗng, issuer = root, public key = khóa Host
-        do MÁY NÀY sinh ra, ký bởi khóa Root — dùng làm client cert khi
-        nâng cấp TLS ở start_session_tls().
-      - Device cert (lá) — TRƯỚC ĐÂY BỊ THIẾU HOÀN TOÀN trong bản cũ: subject
-        rỗng, issuer = root, public key = **public key của CHÍNH THIẾT BỊ**
-        (nhận được từ lockdownd qua GetValue DevicePublicKey), ký bởi khóa
-        Root. Đây là "DeviceCertificate" mà request Pair phải gửi lại cho
-        thiết bị — thiết bị dùng nó để xác nhận rằng host đã nhận đúng public
-        key của mình. Gửi thẳng DevicePublicKey thô (như bản cũ) thay vì
-        DeviceCertificate đã ký khiến trường bắt buộc "DeviceCertificate" bị
-        thiếu trong PairRecord, nhiều khả năng khiến lockdownd từ chối yêu
-        cầu Pair trước khi kịp hiện hộp thoại "Trust" trên iPhone.
-    """
+    """Sinh chuỗi chứng chỉ Root CA → Host cert → Device cert cho pairing.
+    Khớp chính xác cấu trúc mà lockdownd kỳ vọng (đối chiếu với
+    libimobiledevice common/userpref.c và pymobiledevice3 ca.py)."""
     from cryptography import x509
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
-    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key, load_der_public_key
     import datetime
 
     alg = _select_hash_algorithm(device_version)
@@ -214,26 +346,17 @@ def _generate_host_identity(device_public_key_pem: bytes, device_version: str | 
     not_after = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
 
     key_usage = x509.KeyUsage(
-        digital_signature=True,
-        key_encipherment=True,
-        key_cert_sign=False,
-        crl_sign=False,
-        content_commitment=False,
-        data_encipherment=False,
-        key_agreement=False,
-        encipher_only=False,
-        decipher_only=False,
+        digital_signature=True, key_encipherment=True, key_cert_sign=False,
+        crl_sign=False, content_commitment=False, data_encipherment=False,
+        key_agreement=False, encipher_only=False, decipher_only=False,
     )
 
     root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     root_cert = (
         x509.CertificateBuilder()
-        .subject_name(empty_name)
-        .issuer_name(empty_name)
-        .public_key(root_key.public_key())
-        .serial_number(1)
-        .not_valid_before(not_before)
-        .not_valid_after(not_after)
+        .subject_name(empty_name).issuer_name(empty_name)
+        .public_key(root_key.public_key()).serial_number(1)
+        .not_valid_before(not_before).not_valid_after(not_after)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(root_key, alg)
     )
@@ -241,21 +364,14 @@ def _generate_host_identity(device_public_key_pem: bytes, device_version: str | 
     host_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     host_cert = (
         x509.CertificateBuilder()
-        .subject_name(empty_name)
-        .issuer_name(root_cert.subject)
-        .public_key(host_key.public_key())
-        .serial_number(1)
-        .not_valid_before(not_before)
-        .not_valid_after(not_after)
+        .subject_name(empty_name).issuer_name(root_cert.subject)
+        .public_key(host_key.public_key()).serial_number(1)
+        .not_valid_before(not_before).not_valid_after(not_after)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(key_usage, critical=True)
         .sign(root_key, alg)
     )
 
-    # Thử parse PEM trước (-----BEGIN RSA PUBLIC KEY----- hoặc BEGIN PUBLIC KEY);
-    # nếu thất bại, thử parse DER. lockdownd thường trả PEM nhưng một số phiên bản
-    # iOS trả DER binary — cần hỗ trợ cả hai để tránh ValueError crash.
-    from cryptography.hazmat.primitives.serialization import load_der_public_key
     device_public_key = None
     try:
         device_public_key = load_pem_public_key(device_public_key_pem)
@@ -266,14 +382,12 @@ def _generate_host_identity(device_public_key_pem: bytes, device_version: str | 
             raise LockdownError(f"Không parse được DevicePublicKey (thử PEM và DER đều thất bại): {e2}")
     if not isinstance(device_public_key, RSAPublicKey):
         raise LockdownError("DevicePublicKey trả về từ thiết bị không phải khóa RSA hợp lệ.")
+
     device_cert = (
         x509.CertificateBuilder()
-        .subject_name(empty_name)
-        .issuer_name(root_cert.subject)
-        .public_key(device_public_key)
-        .serial_number(1)
-        .not_valid_before(not_before)
-        .not_valid_after(not_after)
+        .subject_name(empty_name).issuer_name(root_cert.subject)
+        .public_key(device_public_key).serial_number(1)
+        .not_valid_before(not_before).not_valid_after(not_after)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(key_usage, critical=True)
         .add_extension(x509.SubjectKeyIdentifier.from_public_key(device_public_key), critical=False)
@@ -290,18 +404,13 @@ def _generate_host_identity(device_public_key_pem: bytes, device_version: str | 
         return cert_or_key.public_bytes(serialization.Encoding.PEM)
 
     def der(cert):
-        """DER (binary) — KHÔNG dùng trong PairRecord gửi cho lockdownd.
-        Chỉ giữ lại để phòng trường hợp cần sau này (vd: kiểm tra cert).
-        PairRecord gửi đi phải dùng PEM (xem bình luận ở request bên dưới)."""
         return cert.public_bytes(serialization.Encoding.DER)
 
     return {
         "root_key_pem": pem(root_key, is_key=True),
-        # DER bytes dùng trong PairRecord gửi lên thiết bị
         "root_cert_der": der(root_cert),
         "host_cert_der": der(host_cert),
         "device_cert_der": der(device_cert),
-        # PEM bytes dùng trong ssl.SSLContext (start_session_tls)
         "root_cert_pem": pem(root_cert),
         "host_key_pem": pem(host_key, is_key=True),
         "host_cert_pem": pem(host_cert),
@@ -310,21 +419,14 @@ def _generate_host_identity(device_public_key_pem: bytes, device_version: str | 
 
 
 def pair_device(udid: str) -> dict:
-    """Thực hiện pairing lần đầu với thiết bị. Trả về "pair record" (dict)
-    cần lưu lại và truyền cho start_session() ở các lần sau. Thiết bị sẽ
-    hiện hộp thoại "Trust This Computer?" — cần người dùng bấm Trust rồi
-    tool mới nhận được phản hồi thành công.
+    """Thực hiện pairing lần đầu với thiết bị. Thiết bị sẽ hiện hộp thoại
+    "Trust This Computer?" — người dùng cần bấm Trust để tiếp tục.
 
-    PairRecord gửi đi khớp CHÍNH XÁC 5 khóa mà lockdownd_pair_record_to_plist()
-    (libimobiledevice src/lockdown.c) tạo ra: DeviceCertificate,
-    HostCertificate, HostID, RootCertificate, SystemBUID — không có
-    DevicePublicKey (bản cũ gửi sai khóa này), không có private key nào."""
-    lockdown = LockdownClient()
+    Tự động dùng SSL nếu iOS 16+ (plaintext bị RST)."""
+    # _open_lockdown() tự động thử plaintext rồi SSL nếu cần.
+    lockdown = _open_lockdown(pair_record=None)
     try:
         print("[pairing] Đang lấy DevicePublicKey từ lockdownd...")
-        # [FIX v5] Retry cho GetValue(DevicePublicKey): nếu lần đầu timeout,
-        # thử lại một lần nữa (thực tế: lần đầu thành công 99% nhờ QueryType
-        # đã được gọi ở __init__, retry là lưới an toàn bổ sung).
         device_public_key_response = None
         for _gpk_attempt in range(2):
             try:
@@ -352,10 +454,9 @@ def pair_device(udid: str) -> dict:
         try:
             device_version = lockdown.get_value(key="ProductVersion")
         except Exception:
-            pass  # không bắt buộc — chỉ ảnh hưởng lựa chọn SHA-1 và cho iOS rất cũ
+            pass
 
-        # Lấy WiFiAddress TRƯỚC khi gửi Pair — lấy sau khi Pair xong khiến
-        # iOS 7 tự ngắt kết nối (ghi chú y hệt trong lockdownd_do_pair()).
+        # Lấy WiFiAddress TRƯỚC khi gửi Pair (iOS 7 tự ngắt kết nối nếu lấy sau)
         wifi_mac_address = None
         try:
             wifi_mac_address = lockdown.get_value(key="WiFiAddress")
@@ -367,7 +468,6 @@ def pair_device(udid: str) -> dict:
         host_id = str(uuid.uuid4()).upper()
         system_buid = str(uuid.uuid4()).upper()
 
-        # pair_record lưu về đĩa — PEM để ssl.SSLContext (start_session_tls) load được
         pair_record = {
             "PairRecordID": host_id,
             "HostID": host_id,
@@ -379,16 +479,10 @@ def pair_device(udid: str) -> dict:
             "HostPrivateKey": identity["host_key_pem"],
         }
 
-        # PairRecord gửi lên thiết bị PHẢI dùng PEM (ASCII text), không phải DER.
-        # Bằng chứng:
-        #   - libimobiledevice lockdown.c hàm lockdownd_pair_record_to_plist():
-        #     plist_new_data(pair_record->device_certificate, strlen(cert))
-        #     strlen() chỉ đúng với PEM (chuỗi ASCII kết thúc bằng '\0') — DER
-        #     là binary, strlen() sẽ dừng sớm ở byte 0x00 đầu tiên → sai hoàn toàn.
-        #   - pymobiledevice3 ca.py generate_pairing_cert_chain():
-        #     trả về serialize_cert_pem(cert) — PEM cho mọi trường cert.
-        # Session-1 đổi sang DER là NHẦM: Trust popup không hiện vì lockdownd
-        # nhận được DER thay vì PEM mà nó kỳ vọng.
+        # PairRecord gửi lên thiết bị PHẢI dùng PEM (ASCII text).
+        # libimobiledevice lockdown.c hàm lockdownd_pair_record_to_plist():
+        # plist_new_data(pair_record->device_certificate, strlen(cert)) —
+        # strlen() chỉ đúng với PEM, DER binary sẽ bị cắt ngắn tại byte 0x00.
         request = {
             "Request": "Pair",
             "Label": "SuperAlphaSideload",
@@ -405,18 +499,17 @@ def pair_device(udid: str) -> dict:
 
         print("[pairing] Đang gửi yêu cầu ghép nối...")
         print("[pairing] *** Kiểm tra màn hình iPhone — bấm 'Tin cậy' (Trust This Computer) ***")
+        print("[pairing] iPhone PHẢI còn sáng màn hình và chưa bị khoá trong bước này.")
+        print("[pairing] Bạn có tối đa 60 giây để bấm Trust sau khi popup xuất hiện.")
 
-        # Gửi trực tiếp (không qua _request()) để kiểm soát timeout riêng
-        _send_plist(lockdown.conn, request)
+        lockdown._send_plist_enc(request)
 
-        # iOS 13+ đôi khi trả PairingDialogResponsePending trước khi hiện dialog.
-        # Timeout 60s vì người dùng cần thời gian đọc + bấm Trust (15s không đủ).
         MAX_PENDING = 12
         PENDING_WAIT = 5.0
         response = None
         for attempt in range(MAX_PENDING):
             try:
-                response = _recv_plist(lockdown.conn, timeout=60.0)
+                response = lockdown._recv_plist_enc(timeout=60.0)
             except Exception as exc:
                 raise LockdownError(
                     f"Timeout 60s chờ phản hồi Pair: {exc}\n"
@@ -427,12 +520,12 @@ def pair_device(udid: str) -> dict:
                 if attempt == 0:
                     print("[pairing] Thiết bị đang hiện hộp thoại Trust — đang chờ bạn bấm...")
                 time.sleep(PENDING_WAIT)
-                _send_plist(lockdown.conn, request)
+                lockdown._send_plist_enc(request)
                 continue
             elif err == "UserDeniedPairing":
                 raise LockdownError(
-                    "Bạn đã bấm 'Không tin cậy' (Don\'t Trust) trên iPhone.\n"
-                    "Ngắt và cắm lại USB, rồi bấm 'Ký & Cài đặt' lại — lần này hãy bấm 'Tin cậy' (Trust)."
+                    "Bạn đã bấm 'Không tin cậy' (Don't Trust) trên iPhone.\n"
+                    "Ngắt và cắm lại USB, rồi bấm 'Ký & Cài đặt' lại — lần này hãy bấm 'Tin cậy'."
                 )
             elif err == "PasswordProtected":
                 raise LockdownError(
@@ -441,7 +534,7 @@ def pair_device(udid: str) -> dict:
                 )
             elif err == "InvalidHostID":
                 raise LockdownError(
-                    "Thiết bị báo InvalidHostID. Xoá pair record cũ (Settings → Xóa dữ liệu ghép nối) và thử lại."
+                    "Thiết bị báo InvalidHostID. Xoá pair record cũ và thử lại."
                 )
             elif err:
                 print(f"[pairing] lockdownd trả lỗi không xác định: {err!r} — phản hồi đầy đủ: {response}")
@@ -460,11 +553,15 @@ def pair_device(udid: str) -> dict:
         lockdown.close()
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# TLS session (StartSession) — dùng sau khi đã paired
+# ─────────────────────────────────────────────────────────────────────────
+
 def start_session_tls(pair_record: dict) -> "TlsLockdownClient":
-    """Mở một LockdownClient mới rồi StartSession + nâng cấp TLS bằng cặp
-    chứng chỉ đã lưu trong pair_record. Đây là phần ÍT được kiểm chứng nhất
-    trong toàn bộ device_link.py (dùng ssl.MemoryBIO bơm tay qua mux_usb)."""
-    lockdown = LockdownClient()
+    """Mở LockdownClient mới rồi StartSession + nâng cấp TLS bằng cặp
+    chứng chỉ đã lưu trong pair_record. Tự động dùng SSL nếu iOS 16+."""
+    # Truyền pair_record để _SslPipe dùng làm client cert nếu cần SSL
+    lockdown = _open_lockdown(pair_record=pair_record)
     response = lockdown._request({
         "Request": "StartSession",
         "Label": "SuperAlphaSideload",
@@ -477,10 +574,12 @@ def start_session_tls(pair_record: dict) -> "TlsLockdownClient":
 
 
 class TlsLockdownClient:
-    """Bọc một LockdownClient đã StartSession thành công bằng TLS (nếu
-    EnableSessionSSL=True), dùng ssl.MemoryBIO để không cần một socket hệ
-    điều hành thật — mọi byte TLS được bơm qua MuxConnection.send()/recv()
-    bằng tay trong _pump_tls()."""
+    """Bọc LockdownClient đã StartSession trong TLS (nếu EnableSessionSSL=True),
+    dùng ssl.MemoryBIO để bơm tay qua MuxConnection.
+
+    Khi LockdownClient đã có _ssl_pipe (iOS 16+ mode), TLS session được tạo
+    TRÊN TOP của SSL layer hiện có — đây là "SSL-in-SSL" hợp lệ vì StartSession
+    trả EnableSessionSSL=True yêu cầu thêm một lớp nữa."""
 
     def __init__(self, lockdown: LockdownClient, pair_record: dict, session_id, tls=True):
         self.lockdown = lockdown
@@ -490,16 +589,8 @@ class TlsLockdownClient:
             self._wrap_tls(pair_record)
 
     def _wrap_tls(self, pair_record):
-        # lockdownd trên iPhone dùng một stack TLS rất cũ/tuỳ biến (nhóm
-        # Diffie-Hellman yếu, không có các phần mở rộng hiện đại). OpenSSL
-        # 3.x mặc định áp @SECLEVEL=2, sẽ từ chối handshake này thẳng thừng
-        # (lỗi điển hình: "dh key too small" / "sslv3 alert handshake
-        # failure" / "certificate verify failed"). Đây là vấn đề tương thích
-        # đã biết rộng rãi khi nói chuyện với lockdownd bằng OpenSSL hiện đại
-        # (không phải lỗi ở logic pairing) — pymobiledevice3 xử lý bằng cách
-        # hạ @SECLEVEL=0 và bật lại cờ legacy renegotiation, áp dụng y hệt ở
-        # đây. Thiếu đoạn này thì dù toàn bộ phần pairing ở trên đúng 100%,
-        # bước nâng cấp TLS vẫn sẽ luôn thất bại trên phần cứng thật.
+        # lockdownd dùng TLS rất cũ/tuỳ biến (DH yếu, legacy renegotiation).
+        # OpenSSL 3.x @SECLEVEL=2 mặc định từ chối — phải hạ @SECLEVEL=0.
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -511,14 +602,19 @@ class TlsLockdownClient:
             ctx.set_ciphers("ALL:!aNULL:!eNULL")
         ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
 
-        import tempfile, os
+        cert_data = pair_record.get("HostCertificate", b"")
+        key_data = pair_record.get("HostPrivateKey", b"")
+        if isinstance(cert_data, str):
+            cert_data = cert_data.encode()
+        if isinstance(key_data, str):
+            key_data = key_data.encode()
         with tempfile.TemporaryDirectory() as tmp:
             cert_path = os.path.join(tmp, "host.pem")
             key_path = os.path.join(tmp, "host.key")
             with open(cert_path, "wb") as f:
-                f.write(pair_record["HostCertificate"])
+                f.write(cert_data)
             with open(key_path, "wb") as f:
-                f.write(pair_record["HostPrivateKey"])
+                f.write(key_data)
             ctx.load_cert_chain(cert_path, key_path)
 
         self._incoming = ssl.MemoryBIO()
@@ -578,13 +674,11 @@ class TlsLockdownClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# installation_proxy — cài đặt IPA đã ký
+# installation_proxy
 # ─────────────────────────────────────────────────────────────────────────
 
 def install_ipa(pair_record: dict, device_ipa_path: str, progress_cb=None):
-    """Gửi lệnh Install tới com.apple.mobile.installation_proxy cho file đã
-    được AFC push lên /PublicStaging (xem afc_push_file). Poll tiến độ và
-    gọi progress_cb(percent, status) nếu được truyền vào."""
+    """Gửi lệnh Install tới com.apple.mobile.installation_proxy."""
     tls = start_session_tls(pair_record)
     try:
         service_response = tls.lockdown._request({
@@ -619,10 +713,7 @@ def install_ipa(pair_record: dict, device_ipa_path: str, progress_cb=None):
 
 
 def list_installed_apps(pair_record: dict) -> list:
-    """Thay thế `ideviceinstaller list` — dùng lệnh "Browse" của
-    installation_proxy, trả về danh sách bundle identifier đã cài trên máy.
-    Dùng bởi sideload_core khi cần tránh trùng App ID (xem list_app_ids.py
-    gốc: get_installed_app_ids_from_device)."""
+    """Trả về danh sách bundle identifier đã cài trên máy."""
     tls = start_session_tls(pair_record)
     try:
         service_response = tls.lockdown._request({
@@ -653,7 +744,7 @@ def list_installed_apps(pair_record: dict) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# AFC — đẩy file IPA lên /PublicStaging trước khi cài
+# AFC
 # ─────────────────────────────────────────────────────────────────────────
 
 AFC_MAGIC = b"CFA6LPAA"
@@ -707,7 +798,6 @@ class AfcClient:
         (file_handle,) = struct.unpack("<Q", header_payload[:8])
 
         total = 0
-        import os
         file_size = os.path.getsize(local_path)
         with open(local_path, "rb") as f:
             while True:
@@ -732,8 +822,7 @@ class AfcClient:
 
 
 def afc_push_ipa(pair_record: dict, local_ipa_path: str, remote_filename: str, progress_cb=None) -> str:
-    """Đẩy file IPA lên /PublicStaging/<remote_filename> trên thiết bị, trả
-    về đường dẫn thiết bị đầy đủ để truyền cho install_ipa()."""
+    """Đẩy file IPA lên /PublicStaging/<remote_filename> trên thiết bị."""
     afc = AfcClient(pair_record)
     try:
         remote_path = f"PublicStaging/{remote_filename}"
@@ -741,7 +830,7 @@ def afc_push_ipa(pair_record: dict, local_ipa_path: str, remote_filename: str, p
             afc._send_packet(AFC_OP_MAKE_DIR, b"PublicStaging\x00")
             afc._recv_packet()
         except Exception:
-            pass  # thư mục có thể đã tồn tại — bỏ qua lỗi ở bước này
+            pass  # thư mục có thể đã tồn tại
         afc.push_file(local_ipa_path, remote_path, progress_cb=progress_cb)
         return f"/{remote_path}"
     finally:
@@ -753,19 +842,13 @@ def afc_push_ipa(pair_record: dict, local_ipa_path: str, remote_filename: str, p
 # ─────────────────────────────────────────────────────────────────────────
 
 def reset_mux_device():
-    """Huỷ singleton MuxDevice hiện tại (dừng pump thread, đóng USB).
-    Phải gọi ở ĐẦU mỗi lần chạy do_sideload() để đảm bảo mỗi lần sideload
-    bắt đầu bằng một phiên USB hoàn toàn mới — không dùng lại pump thread
-    hoặc trạng thái TCP còn sót từ lần chạy trước (kể cả khi lần trước
-    thất bại hoặc iPhone đã bị rút cắm lại)."""
+    """Huỷ singleton MuxDevice hiện tại. Gọi ở đầu mỗi lần chạy do_sideload()."""
     from mux_usb import reset_device as _mux_reset
     _mux_reset()
 
 
 def validate_pair_record(pair_record: dict) -> bool:
-    """Kiểm tra nhanh pair record: đảm bảo các trường bắt buộc có mặt và
-    không rỗng. KHÔNG kết nối thiết bị — chỉ kiểm tra cấu trúc dict.
-    Trả True nếu record trông hợp lệ, False nếu bị thiếu trường hoặc rỗng."""
+    """Kiểm tra nhanh pair record: đảm bảo các trường bắt buộc có mặt và không rỗng."""
     required_keys = ["HostID", "SystemBUID", "HostCertificate", "HostPrivateKey",
                      "RootCertificate", "RootPrivateKey"]
     for key in required_keys:
@@ -773,8 +856,6 @@ def validate_pair_record(pair_record: dict) -> bool:
         if not val:
             print(f"[pairing] Pair record thiếu hoặc trống trường '{key}' — cần ghép nối lại.")
             return False
-    # EscrowBag bắt buộc trên iOS 7+ — nếu không có, record được tạo từ
-    # một lần ghép nối không hoàn chỉnh (iOS chưa trả EscrowBag).
     if not pair_record.get("EscrowBag"):
         print("[pairing] Pair record không có EscrowBag (iOS 7+) — cần ghép nối lại.")
         return False
