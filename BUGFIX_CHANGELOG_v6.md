@@ -92,6 +92,7 @@
 [pairing] ✅ Ghép nối thành công.
 ```
 
+
 ---
 
 ## Tóm tắt thay đổi
