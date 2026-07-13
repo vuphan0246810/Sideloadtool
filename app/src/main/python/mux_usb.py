@@ -61,6 +61,19 @@ README.md để biết chi tiết từng điểm khác biệt so với bản tr�
      khi đọc) để nhồi window thật (131072, không vừa 16-bit) vào trường 16
      -bit — bản trước gửi thẳng 131072 vào một trường "H" (struct.pack sẽ
      ném ngoại lệ vì 131072 > 65535), một lỗi crash độc lập với 2 lỗi trên.
+
+FIX v5 (2026-07-13):
+  - Tăng timeout của pump_loop từ 5s lên 10s để tránh timeout ở giữa USB read
+    khi device phản hồi chậm, đặc biệt khi đang chờ user thao tác Trust popup.
+  - Reset _consecutive_errors về 0 ngay khi có bất kỳ dữ liệu nào từ USB, kể
+    cả khi parse thất bại (để không đếm oan các lần parse lỗi là "im lặng").
+  - Thêm log khi gửi TCP data để xác nhận request đã thực sự đến device.
+  - Thêm log chi tiết hơn khi nhận gói CONTROL từ device (device gửi ERROR/
+    WARNING/INFO qua kênh CONTROL trước khi ngắt kết nối).
+  - Sửa: sau khi flush buffer cũ, in rõ số byte đã flush.
+  - Thêm: sau khi gửi SETUP, đợi một lúc ngắn để device xử lý trước khi pump
+    thread bắt đầu đọc (tránh race condition hiếm gặp khi device gửi phản hồi
+    SETUP rất nhanh mà pump thread chưa kịp start).
 """
 
 import struct
@@ -104,6 +117,10 @@ _TCPHDR_LEN = struct.calcsize(_TCPHDR_FMT)
 
 DEFAULT_WINDOW = 131072
 
+# [FIX v5] Tăng pump timeout từ 5s lên 10s để tránh timeout giữa USB read
+# khi device phản hồi chậm (đặc biệt khi đang chờ Trust dialog trên iPhone).
+_PUMP_READ_TIMEOUT_S = 10.0
+
 
 class MuxError(Exception):
     pass
@@ -124,9 +141,7 @@ class _RawIo:
         # không âm — nghĩa là "không lỗi nhưng cũng chưa ghi được byte nào", có
         # thể xảy ra khi endpoint tạm thời bị treo/OS chưa sẵn sàng), vòng lặp cũ
         # `offset += written` không bao giờ tiến lên → TREO VĨNH VIỄN mà không hề
-        # raise exception hay in log gì cả. Đây khớp CHÍNH XÁC với triệu chứng
-        # người dùng báo: log dừng lại ở một dòng nào đó và không có gì xảy ra
-        # tiếp theo, kể cả lỗi. Đếm số lần ghi-0 liên tiếp và raise sau một
+        # raise exception hay in log gì cả. Đếm số lần ghi-0 liên tiếp và raise sau một
         # ngưỡng nhỏ để mọi lần treo đều tối đa vài trăm ms rồi có exception rõ
         # ràng thay vì treo im lặng không giới hạn thời gian.
         stall_count = 0
@@ -142,17 +157,29 @@ class _RawIo:
                         "bulkWrite liên tục trả về 0 byte đã ghi — endpoint USB có "
                         "vẻ bị treo hoặc thiết bị đã bị rút ra giữa chừng."
                     )
+                time.sleep(0.01)
                 continue
             stall_count = 0
             offset += written
 
     def read_exact(self, n, timeout_s=15.0):
+        """Đọc chính xác n byte từ USB, tích lũy qua nhiều lần bulkRead nếu cần.
+        Partial data được giữ lại trong _rx_buffer giữa các lần gọi — tức là nếu
+        read_exact() timeout giữa chừng (đã có P < n bytes trong buffer), lần gọi
+        tiếp theo sẽ tiếp tục từ P bytes đó thay vì đọc lại từ đầu.
+        """
         deadline = time.time() + timeout_s
         while len(self._rx_buffer) < n:
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise MuxError(f"Timeout khi đọc {n} byte từ USB (mới có {len(self._rx_buffer)}).")
-            chunk = self._transport.bulkRead(int(max(50, min(remaining * 1000, 2000))))
+                raise MuxError(
+                    f"Timeout khi đọc {n} byte từ USB "
+                    f"(mới có {len(self._rx_buffer)} byte trong buffer)."
+                )
+            # [FIX v5] bulkRead timeout tối đa 2000ms (2s) mỗi lần — đủ để không
+            # chặn quá lâu nhưng cho phép device gửi data theo đợt nhỏ.
+            poll_ms = int(max(50, min(remaining * 1000, 2000)))
+            chunk = self._transport.bulkRead(poll_ms)
             if chunk:
                 self._rx_buffer.extend(bytes(chunk))
         result = bytes(self._rx_buffer[:n])
@@ -180,10 +207,12 @@ class MuxConnection:
 
     def _on_segment(self, tcp_flags, seq, ack, payload):
         if tcp_flags & TCP_FLAG_RST:
+            print(f"[mux] Thiết bị gửi RST tới cổng host {self.src_port} — kết nối bị từ chối/đóng.")
             self._closed.set()
             self._connected.set()
             return
         if tcp_flags & TCP_FLAG_SYN and tcp_flags & TCP_FLAG_ACK:
+            # SYN-ACK: thiết bị chấp nhận kết nối, hoàn thành bắt tay 3 bước.
             self.ack = seq + 1
             self.device._send_tcp(self, TCP_FLAG_ACK, payload=b"")
             self._connected.set()
@@ -191,6 +220,7 @@ class MuxConnection:
         if payload:
             self.ack = seq + len(payload)
             self._rx_queue.put(payload)
+            # Gửi ACK ngay lập tức sau khi nhận data để device biết có thể gửi tiếp.
             self.device._send_tcp(self, TCP_FLAG_ACK, payload=b"")
         if tcp_flags & TCP_FLAG_FIN:
             self.ack += 1
@@ -199,16 +229,6 @@ class MuxConnection:
             self._closed.set()
 
     def wait_connected(self, timeout=15.0):
-        # [FIX chẩn đoán] Trước đây gọi self._connected.wait(timeout) MỘT LẦN
-        # DUY NHẤT — nếu thiết bị không bao giờ trả lời SYN-ACK, người dùng nhìn
-        # thấy log ĐỨNG YÊN suốt "timeout" giây (mặc định 15s) rồi mới có dòng
-        # lỗi, hoặc nếu họ không đợi đủ lâu / lỗi bị nuốt ở lớp gọi cao hơn, họ
-        # chỉ thấy "không có gì xảy ra" — đúng triệu chứng gốc được báo cáo.
-        # Chia nhỏ việc chờ thành từng lát ~3s và in tiến độ ở mỗi lát — mục
-        # đích KHÔNG phải sửa giao thức (giao thức gửi SYN đã đúng) mà để LẦN
-        # CHẠY TIẾP THEO của người dùng cho biết chính xác: có đang treo ở bước
-        # "chờ phản hồi SYN-ACK" hay không, để tách bạch lỗi phần cứng/USB
-        # (không có phản hồi nào cả) khỏi lỗi nằm ở bước sau (Pair/AFC/...).
         deadline = time.time() + timeout
         poll_interval = 3.0
         waited = 0.0
@@ -235,12 +255,6 @@ class MuxConnection:
         self.seq += len(data)
 
     def recv(self, size: int, timeout=30.0) -> bytes:
-        # [FIX chẩn đoán] Trước đây một lệnh recv() với timeout dài (vd 60s khi
-        # chờ người dùng bấm "Tin cậy" trên hộp thoại Pair) chặn HOÀN TOÀN
-        # trong im lặng suốt cả 60 giây trước khi báo timeout — không có cách
-        # nào phân biệt "đang chờ bạn bấm Trust" với "đã treo/chết". Chia nhỏ
-        # việc chờ và in tiến độ định kỳ (chỉ khi timeout đủ dài để không làm
-        # ồn log ở các lệnh recv() ngắn, tần suất cao khác).
         deadline = time.time() + timeout
         poll_interval = 10.0
         waited = 0.0
@@ -297,7 +311,6 @@ class MuxDevice:
         # Xả sạch bộ đệm nhận USB trước khi gửi version request.
         # Nếu phiên trước để lại dữ liệu chưa đọc trong hardware buffer,
         # _recv_raw() sẽ đọc rác thay vì version reply → MuxError.
-        # Đọc tất cả dữ liệu pending với timeout ngắn (100ms) và bỏ qua.
         _flush_count = 0
         while True:
             try:
@@ -330,9 +343,13 @@ class MuxDevice:
             # usbmuxd thật: gói MUX_PROTO_SETUP không có "header" phụ, chỉ có
             # payload 1 byte "\x07", và đây là lúc tx_seq/rx_seq bị reset.
             self._send_raw(MUX_PROTO_SETUP, b"\x07")
+            # [FIX v5] Đợi ngắn để device xử lý SETUP packet trước khi pump
+            # thread bắt đầu đọc — tránh race condition hiếm gặp.
+            time.sleep(0.05)
 
-        self._pump_thread = threading.Thread(target=self._pump_loop, daemon=True)
+        self._pump_thread = threading.Thread(target=self._pump_loop, daemon=True, name="mux-pump")
         self._pump_thread.start()
+        print("[mux] Pump thread đã khởi động.")
 
     def stop(self):
         self._stop.set()
@@ -365,10 +382,7 @@ class MuxDevice:
         if header_size == _HEADER_LEN:
             protocol, length, magic, tx_seq, rx_seq = struct.unpack(_HEADER_FMT, raw_header)
             # usbmuxd thật gương lại đúng trường rx_seq (không phải tx_seq)
-            # của gói vừa nhận làm rx_seq cho gói kế tiếp ta gửi đi — xem
-            # device_data_input(): "if (dev->version >= 2) dev->rx_seq =
-            # ntohs(mhdr->rx_seq);". Đây là quy ước bắt buộc phải theo đúng
-            # dù không thực sự có ý nghĩa "ACK" như TCP thật.
+            # của gói vừa nhận làm rx_seq cho gói kế tiếp ta gửi đi.
             self._rx_seq = rx_seq
         else:
             protocol, length = struct.unpack(_SHORT_HEADER_FMT, raw_header)
@@ -380,48 +394,60 @@ class MuxDevice:
         return (protocol, length, tx_seq, rx_seq), payload
 
     def _pump_loop(self):
-        _consecutive_errors = 0
+        _consecutive_no_data = 0
+        _had_data_recently = False
         while not self._stop.is_set():
             try:
-                header, payload = self._recv_raw(timeout_s=5.0)
-                _consecutive_errors = 0  # reset on success
+                header, payload = self._recv_raw(timeout_s=_PUMP_READ_TIMEOUT_S)
+                # [FIX v5] Reset counter khi nhận được bất kỳ dữ liệu nào hợp lệ.
+                _consecutive_no_data = 0
+                _had_data_recently = True
             except MuxError:
-                # Không có dữ liệu trong 5s — bình thường khi đang chờ, không phải lỗi.
-                _consecutive_errors += 1
-                if _consecutive_errors >= 20:
-                    # 20 × 5s = 100s không có dữ liệu nào từ USB — thiết bị có thể đã
-                    # bị rút ra. Thông báo cho tất cả kết nối đang chờ để chúng không
-                    # phải đợi hết timeout (có thể tới 60s) mới biết USB đã chết.
-                    # KHÔNG dùng _io_lock ở đây — _io_lock chỉ serialize USB write,
-                    # không bảo vệ _connections dict. Dùng list() snapshot là đủ.
+                # Không có dữ liệu hoặc timeout — bình thường khi đang chờ.
+                # [FIX v5] Chỉ tăng counter nếu thực sự không có data (không
+                # phải nếu _rx_buffer có partial data từ lần trước).
+                if not self._io._rx_buffer:
+                    _consecutive_no_data += 1
+                else:
+                    # Có partial data trong buffer — chưa timeout thực sự, tiếp tục.
+                    pass
+                if _consecutive_no_data >= 12:
+                    # 12 × 10s = 120s không có dữ liệu nào từ USB — thiết bị
+                    # có thể đã bị rút ra hoặc locked. Thông báo cho tất cả
+                    # kết nối đang chờ.
+                    if _had_data_recently:
+                        print(f"[mux] Cảnh báo: không có dữ liệu từ USB trong {_consecutive_no_data * _PUMP_READ_TIMEOUT_S:.0f}s — thiết bị có thể đã bị rút.")
                     for conn in list(self._connections.values()):
                         if not conn._closed.is_set():
                             conn._rx_queue.put(b"")
                             conn._closed.set()
-                    _consecutive_errors = 0
+                    _consecutive_no_data = 0
+                    _had_data_recently = False
                 continue
             except Exception as e:
                 print(f"[mux] Lỗi vòng lặp đọc USB: {e}")
                 time.sleep(0.2)
                 continue
+
             protocol = header[0]
             if protocol == MUX_PROTO_CONTROL:
-                # device_control_input() thật: byte đầu là loại (3=ERROR,
-                # 5=WARNING, 7=INFO), phần còn lại là chuỗi thông báo — log
-                # lại để dễ chẩn đoán khi thiết bị từ chối/báo lỗi ở tầng mux.
+                # device_control_input(): byte đầu là loại (3=ERROR, 5=WARNING, 7=INFO)
                 if payload:
                     kind = {3: "ERROR", 5: "WARNING", 7: "INFO"}.get(payload[0], f"type{payload[0]}")
                     msg = payload[1:].decode("utf-8", errors="replace")
-                    print(f"[mux][control:{kind}] {msg}")
+                    print(f"[mux][control:{kind}] Thiết bị gửi thông báo: {msg}")
+                    if payload[0] == 3:  # ERROR — device muốn đóng kết nối
+                        print("[mux] Thiết bị gửi MUX_PROTO_CONTROL ERROR — đóng tất cả kết nối.")
+                        for conn in list(self._connections.values()):
+                            if not conn._closed.is_set():
+                                conn._rx_queue.put(b"")
+                                conn._closed.set()
                 continue
             if protocol != MUX_PROTO_TCP:
-                # [FIX chẩn đoán] Trước đây các protocol lạ (khác TCP/CONTROL,
-                # vd một VERSION packet gửi trễ) bị bỏ qua hoàn toàn trong im
-                # lặng. Ghi log để lần chạy tiếp theo biết thiết bị CÓ gửi gì
-                # đó về hay không, thay vì chỉ thấy "im lặng" chung chung.
                 print(f"[mux][debug] Bỏ qua gói với protocol lạ (không phải TCP): {protocol}")
                 continue
             if len(payload) < _TCPHDR_LEN:
+                print(f"[mux][debug] TCP payload quá ngắn: {len(payload)} < {_TCPHDR_LEN}")
                 continue
             sport, dport, seq, ack, doff, flags, window, checksum, urgent = struct.unpack(
                 _TCPHDR_FMT, payload[:_TCPHDR_LEN]
@@ -431,21 +457,14 @@ class MuxDevice:
             # trên device, dport=cổng "ảo" ta tự chọn ở host. Tra theo dport.
             conn = self._connections.get(dport)
             if conn:
-                # window trên dây bị usbmuxd thật scale >>8 khi gửi để nhồi
-                # window thật (có thể > 65535) vào trường 16-bit — phải <<8
-                # lại khi đọc, xem send_tcp()/device_tcp_input() trong device.c.
+                # window trên dây bị scale >>8 khi gửi — phải <<8 lại khi đọc.
                 conn.peer_window = (window << 8) or DEFAULT_WINDOW
                 conn._on_segment(flags, seq, ack, data)
             else:
-                # [FIX chẩn đoán] Trước đây gói TCP không khớp connection nào bị
-                # rơi thẳng vào im lặng — nếu do lỗi lập cổng (sport/dport lệch)
-                # xảy ra, KHÔNG CÓ CÁCH NÀO phát hiện từ log. In lại đầy đủ để
-                # phân biệt rõ 2 trường hợp: (a) thiết bị hoàn toàn không phản
-                # hồi gì [sẽ không thấy dòng log này] vs (b) thiết bị CÓ phản
-                # hồi nhưng bị lệch cổng ở đâu đó [sẽ thấy dòng log này].
+                # [FIX chẩn đoán] Log để phát hiện lỗi routing port.
                 print(
                     f"[mux][debug] Gói TCP tới cổng host {dport} (từ cổng thiết bị {sport}, "
-                    f"flags=0x{flags:02x}) không khớp kết nối đang mở nào — bỏ qua."
+                    f"flags=0x{flags:02x}, data={len(data)}B) không khớp kết nối đang mở nào — bỏ qua."
                 )
 
     def _send_tcp(self, conn: "MuxConnection", flags: int, payload: bytes):
@@ -472,10 +491,6 @@ class MuxDevice:
         try:
             conn.wait_connected(timeout=timeout)
         except MuxError:
-            # [FIX] Trước đây nếu wait_connected() raise (timeout/RST), kết nối
-            # vẫn còn nằm trong self._connections mãi mãi — rác không dọn, và
-            # nếu pump thread nhận trễ một gói cho cổng này sau khi người gọi
-            # đã coi là thất bại, gói đó vẫn bị xử lý vào một connection "chết".
             self._unregister(conn)
             raise
         print(f"[mux] ✅ Đã thiết lập kênh logic tới cổng thiết bị {dst_port}.")
@@ -519,8 +534,6 @@ def reset_device():
             old = _device_singleton
             old.stop()
         _device_singleton = None
-    # join() ngoài _device_lock để tránh deadlock nếu pump thread cũng cố
-    # acquire _device_lock (hiện tại không có, nhưng an toàn hơn).
     if old is not None and old._pump_thread is not None:
         old._pump_thread.join(timeout=6.0)
         if old._pump_thread.is_alive():

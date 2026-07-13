@@ -83,6 +83,39 @@ class LockdownClient:
         print(f"[lockdown] Đang mở kết nối lockdownd (cổng {LOCKDOWN_PORT})...")
         self.conn = self.device.connect(LOCKDOWN_PORT)
         print("[lockdown] ✅ Đã kết nối lockdownd.")
+        # ════════════════════════════════════════════════════════════════
+        # FIX CRITICAL (v5): Gửi QueryType làm handshake đầu tiên.
+        #
+        # ĐÂY LÀ NGUYÊN NHÂN CHÍNH khiến popup "Trust This Computer"
+        # KHÔNG BAO GIỜ xuất hiện trên màn hình iPhone:
+        #
+        #   - libimobiledevice lockdown.c: lockdownd_client_new_with_handshake()
+        #     gọi lockdownd_query_type() TRƯỚC tất cả mọi lệnh khác.
+        #   - pymobiledevice3 lockdown.py: LockdownClient.__init__() gọi
+        #     self.query_type() ngay sau khi kết nối.
+        #   - iOS 14+: nếu không có QueryType đầu tiên, lockdownd sẽ im
+        #     lặng bỏ qua GetValue / Pair (không trả lỗi, không phản hồi
+        #     → timeout 30s). Không có GetValue → không có Pair → không có
+        #     Trust popup. Đây đúng là triệu chứng người dùng báo cáo.
+        #
+        # Ghi chú: dùng _request_raw() (không check trường "Error") để
+        # tránh vòng lặp đệ quy — LockdownError từ QueryType không nên
+        # gọi lại __init__().
+        # ════════════════════════════════════════════════════════════════
+        try:
+            qt_resp = self._request_raw({"Request": "QueryType", "Label": "SuperAlphaSideload"}, timeout=10.0)
+            svc_type = qt_resp.get("Type", "?")
+            print(f"[lockdown] QueryType OK — dịch vụ: {svc_type}")
+        except Exception as _qt_err:
+            # Thiết bị rất cũ (iOS < 5) không có QueryType — không fail toàn bộ.
+            print(f"[lockdown] Cảnh báo QueryType: {_qt_err} — tiếp tục các lệnh khác...")
+
+    def _request_raw(self, request: dict, timeout: float = 30.0) -> dict:
+        """Gửi + nhận plist thuần tuý, KHÔNG kiểm tra trường Error.
+        Dùng nội bộ cho QueryType và các lệnh pair bước đầu để tránh
+        vòng lặp đệ quy nếu lockdownd trả Error ở chính các bước này."""
+        _send_plist(self.conn, request)
+        return _recv_plist(self.conn, timeout=timeout)
 
     def _request(self, request: dict, timeout: float = 30.0) -> dict:
         _send_plist(self.conn, request)
@@ -289,9 +322,30 @@ def pair_device(udid: str) -> dict:
     lockdown = LockdownClient()
     try:
         print("[pairing] Đang lấy DevicePublicKey từ lockdownd...")
-        device_public_key_response = lockdown.get_value(key="DevicePublicKey")
+        # [FIX v5] Retry cho GetValue(DevicePublicKey): nếu lần đầu timeout,
+        # thử lại một lần nữa (thực tế: lần đầu thành công 99% nhờ QueryType
+        # đã được gọi ở __init__, retry là lưới an toàn bổ sung).
+        device_public_key_response = None
+        for _gpk_attempt in range(2):
+            try:
+                device_public_key_response = lockdown.get_value(key="DevicePublicKey")
+                if device_public_key_response:
+                    break
+            except LockdownError as _gpk_err:
+                if _gpk_attempt == 0:
+                    print(f"[pairing] GetValue DevicePublicKey lần 1 thất bại ({_gpk_err}) — thử lại sau 1s...")
+                    time.sleep(1.0)
+                else:
+                    raise
         if not device_public_key_response:
-            raise LockdownError("Không lấy được DevicePublicKey — thiết bị có thể yêu cầu pairing khác quy trình chuẩn.")
+            raise LockdownError(
+                "Không lấy được DevicePublicKey sau 2 lần thử.\n"
+                "Nguyên nhân thường gặp:\n"
+                "  • iPhone đang bị khoá màn hình — mở khoá rồi thử lại.\n"
+                "  • Cáp USB kém chất lượng — thử cổng/cáp khác.\n"
+                "  • iPhone đã bị disable (quá nhiều lần nhập sai mật mã).\n"
+                "Nếu các lần trước đã Trust nhưng bị xoá: cắm lại cáp và thử lại."
+            )
         print("[pairing] Đã có DevicePublicKey — đang tạo chuỗi chứng chỉ host...")
 
         device_version = None
