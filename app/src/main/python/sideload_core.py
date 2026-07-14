@@ -462,7 +462,20 @@ def do_sideload(
             # BUGFIX v12: register_device(device_name, device_udid) — args cũ bị
             # đảo ngược: udid được truyền vào tham số device_NAME → Apple nhận
             # deviceNumber="Android Sideload Device" (tên thiết bị thay vì UDID).
-            dev_api.register_device("Android Sideload Device", udid)
+            #
+            # BUGFIX v14: giá trị trả về CHƯA TỪNG được kiểm tra — nếu Apple từ
+            # chối đăng ký (vd UDID sai định dạng, hoặc lỗi tạm thời), code cũ
+            # vẫn đi tiếp bình thường tới bước tải Provisioning Profile như thể
+            # thiết bị đã đăng ký thành công. Vì team chưa thực sự có thiết bị
+            # nào, Apple sẽ báo resultCode 8220 "Your team has no devices from
+            # which to generate a provisioning profile" ở bước SAU — rất khó
+            # truy về đúng nguyên nhân gốc (đăng ký thiết bị thất bại) từ lỗi
+            # đó. Giờ kiểm tra ngay và dừng lại với thông báo rõ ràng.
+            if not dev_api.register_device("Android Sideload Device", udid):
+                err_msg = (dev_api.last_error or {}).get("userString") or "lỗi không xác định"
+                print(f"❌ Không đăng ký được thiết bị UDID {udid}: {err_msg}")
+                return False
+            print(f"✅ Đăng ký thiết bị thành công: {udid}")
 
         # BUGFIX v11: download_provisioning_profile(appIdId) là method đúng.
         # create_provisioning_profile() không tồn tại trong developer_api.py.
@@ -505,22 +518,48 @@ def do_sideload(
         set_bundle_id(app_dir, effective_bundle)
 
         # ── Ký IPA bằng zsign ─────────────────────────────────────────────────
+        #
+        # BUGFIX v14 [CRITICAL]: code cũ gọi run_command(["zsign", ...]) — tức
+        # subprocess tìm một binary tên "zsign" trong PATH của tiến trình
+        # Android. Android KHÔNG có PATH kiểu Linux desktop và app không được
+        # phép exec() file tuỳ ý ngoài nativeLibraryDir(); "zsign" không tồn
+        # tại ở đâu cả trên máy thật (chỉ tồn tại trong Termux, môi trường
+        # gốc mà tool này được port từ đó) → subprocess raise
+        # FileNotFoundError: [Errno 2] No such file or directory: 'zsign'
+        # — đúng lỗi thấy trong log người dùng report ("zsign thất bại:
+        # [Errno 2] No such file or directory: 'zsign'").
+        #
+        # AppPaths.zsignPath() (Kotlin, app/.../bridge/AppPaths.kt) đã trỏ
+        # đúng tới binary zsign thật được đóng gói cùng APK
+        # (jniLibs/arm64-v8a/libzsign.so) — nhưng chưa từng được dùng ở đây.
+        # Đồng thời phải set LD_LIBRARY_PATH=AppPaths.nativeDepsDir() khi
+        # spawn, vì libzsign.so cần libssl.so.3/libcrypto.so.3/libc++_shared.so
+        # đã được AppPaths.nativeDepsDir() tự giải nén sẵn (xem chú thích chi
+        # tiết trong AppPaths.kt) — nếu không, linker không tìm thấy 3 thư
+        # viện này và zsign thoát ngay với "CANNOT LINK EXECUTABLE".
         print("Đang ký IPA bằng zsign...")
         signed_ipa = os.path.join(work_dir, "signed.ipa")
+        zsign_bin = AppPaths.zsignPath()
+        zsign_env = {"LD_LIBRARY_PATH": AppPaths.nativeDepsDir()}
         # BUGFIX v12: run_command() trả về str (stdout) hoặc raise CalledProcessError,
         # KHÔNG phải tuple (bool, str). Unpacking "ok_sign, sign_out = run_command(...)"
         # gây ValueError ngay cả khi zsign thành công.
         try:
             run_command([
-                "zsign",
+                zsign_bin,
                 "-k", key_file,
                 "-c", cert_file,
                 "-m", profile_file,
                 "-o", signed_ipa,
                 "-z", "9",
                 ipa_path,
-            ])
+            ], extra_env=zsign_env)
             print("✅ Ký IPA thành công.")
+        except FileNotFoundError as e:
+            print(f"❌ zsign thất bại: không tìm thấy binary tại '{zsign_bin}' ({e}). "
+                  f"Kiểm tra APK có đúng ABI arm64-v8a và jniLibs/arm64-v8a/libzsign.so "
+                  f"có được đóng gói vào bản build này không.")
+            return False
         except Exception as e:
             print(f"❌ zsign thất bại: {e}")
             return False
