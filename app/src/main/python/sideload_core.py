@@ -199,10 +199,14 @@ def do_sideload(
 
         # ── Giải nén IPA ─────────────────────────────────────────────────────
         print("Đang giải nén IPA...")
-        app_dir = extract_ipa(ipa_path, work_dir)
-        if not app_dir:
-            print("❌ Không giải nén được IPA.")
-            return False
+        # BUGFIX v12: extract_ipa() trả về output_dir (work_dir), KHÔNG phải
+        # đường dẫn tới .app bundle. Gọi trực tiếp app_dir = extract_ipa(...)
+        # rồi get_bundle_id(app_dir) → tìm Info.plist trong sideload_work/ →
+        # không tồn tại → "Info.plist không tìm thấy trong .../sideload_work".
+        # Fix: tách thành 2 bước — giải nén xong, rồi find_app_bundle() để
+        # lấy đường dẫn thật tới SomeApp.app/
+        extract_ipa(ipa_path, work_dir)
+        app_dir = find_app_bundle(work_dir)
         bundle_id = get_bundle_id(app_dir)
         app_name  = get_app_name(app_dir)
         print(f"Ứng dụng: {app_name} ({bundle_id})")
@@ -329,7 +333,10 @@ def do_sideload(
         )
         if not registered:
             print(f"Đang đăng ký thiết bị UDID: {udid}")
-            dev_api.register_device(udid, "Android Sideload Device")
+            # BUGFIX v12: register_device(device_name, device_udid) — args cũ bị
+            # đảo ngược: udid được truyền vào tham số device_NAME → Apple nhận
+            # deviceNumber="Android Sideload Device" (tên thiết bị thay vì UDID).
+            dev_api.register_device("Android Sideload Device", udid)
 
         # BUGFIX v11: download_provisioning_profile(appIdId) là method đúng.
         # create_provisioning_profile() không tồn tại trong developer_api.py.
@@ -355,19 +362,23 @@ def do_sideload(
         # ── Ký IPA bằng zsign ─────────────────────────────────────────────────
         print("Đang ký IPA bằng zsign...")
         signed_ipa = os.path.join(work_dir, "signed.ipa")
-        ok_sign, sign_out = run_command([
-            "zsign",
-            "-k", key_file,
-            "-c", cert_file,
-            "-m", profile_file,
-            "-o", signed_ipa,
-            "-z", "9",
-            ipa_path,
-        ])
-        if not ok_sign:
-            print(f"❌ zsign thất bại: {sign_out}")
+        # BUGFIX v12: run_command() trả về str (stdout) hoặc raise CalledProcessError,
+        # KHÔNG phải tuple (bool, str). Unpacking "ok_sign, sign_out = run_command(...)"
+        # gây ValueError ngay cả khi zsign thành công.
+        try:
+            run_command([
+                "zsign",
+                "-k", key_file,
+                "-c", cert_file,
+                "-m", profile_file,
+                "-o", signed_ipa,
+                "-z", "9",
+                ipa_path,
+            ])
+            print("✅ Ký IPA thành công.")
+        except Exception as e:
+            print(f"❌ zsign thất bại: {e}")
             return False
-        print("✅ Ký IPA thành công.")
 
         # ── Cài đặt lên thiết bị qua USB ─────────────────────────────────────
         print("Đang kết nối với thiết bị iOS qua USB...")
