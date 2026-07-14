@@ -41,7 +41,13 @@ android {
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
 
     packaging {
-        resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            // bcprov/bcutil/bcpkix-jdk18on đều đóng gói cùng 1 file OSGi manifest ở
+            // đường dẫn multi-release này -> mergeDebugJavaResource báo trùng file.
+            // Nội dung file này không được app dùng tới nên loại bỏ là an toàn.
+            excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+        }
         jniLibs { useLegacyPackaging = true }
     }
 
