@@ -1,9 +1,11 @@
 /*
- * ĐÃ SỬA v8: Khôi phục Chaquopy Python cho apple_auth/developer_api/sideload_core.
- * USB/lockdown vẫn dùng native C (libsideloadnative.so).
- * Chỉ mux_usb.py và device_link.py được port sang native — các file Python khác
- * (apple_auth.py, developer_api.py, sideload_core.py, config_manager.py, utils.py)
- * chạy qua Chaquopy như trước.
+ * ĐÃ SỬA v9: Chuyển cấu hình Chaquopy pip ra file python-config.gradle (Groovy DSL)
+ * vì Kotlin DSL không thể giải quyết extension `python {}` mà Chaquopy thêm động
+ * vào DefaultConfig (không có type-safe accessor được sinh ra).
+ * Xem: app/python-config.gradle
+ *
+ * USB/lockdown vẫn dùng native C. Chỉ mux_usb.py + device_link.py đã port sang
+ * native; các file Python khác chạy qua Chaquopy như trước.
  */
 plugins {
     id("com.android.application")
@@ -24,19 +26,6 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake { cppFlags(""); arguments("-DANDROID_STL=c++_shared") }
-        }
-
-        // ── Chaquopy Python runtime ─────────────────────────────────────────
-        python {
-            // Các gói Python cần thiết:
-            //   requests    — HTTP client cho apple_auth.py / developer_api.py
-            //   cryptography— RSA/SSL cho device_link SSL temp cert và signing
-            //   srp         — SRP auth cho apple_auth.py (đăng nhập Apple ID)
-            pip {
-                install("requests")
-                install("cryptography")
-                install("srp")
-            }
         }
     }
 
@@ -95,3 +84,8 @@ dependencies {
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
+
+// Cấu hình Chaquopy pip đặt trong file Groovy riêng vì Kotlin DSL không thể
+// giải quyết extension `python {}` mà Chaquopy thêm động vào DefaultConfig.
+// Groovy DSL dispatch động nên tìm thấy extension ngay khi chạy.
+apply(from = "python-config.gradle")
