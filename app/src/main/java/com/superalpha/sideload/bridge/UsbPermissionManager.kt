@@ -17,38 +17,42 @@ import java.util.concurrent.atomic.AtomicLong
  *   2. ask the user (system dialog) if not already granted,
  *   3. hand the granted device to [UsbTransport.open].
  *
- * FIX: Thêm cooldown 3 giây giữa các lần thử kết nối.
+ * ═══════════════════════════════════════════════════════════════════
+ * FIX: Cooldown chính xác để phá vòng lặp claimInterface → close → re-enumerate → ATTACHED
  *
- * Root cause vòng lặp "claimInterface() thất bại" lặp vô tận:
- *   Sau khi claimInterface() fail và ta gọi conn.close(), Android có thể
- *   re-enumerate thiết bị và gửi lại ACTION_USB_DEVICE_ATTACHED. Nếu không
- *   có cooldown, MainActivity.handleUsbAttachIntent() lại gọi requestAndOpen()
- *   ngay lập tức → fail → close → ATTACHED lại → vòng lặp vô hạn.
+ * Root cause vòng lặp:
+ *   a) UsbTransport.open() thực hiện retry tối đa 5 lần, mỗi lần cách nhau
+ *      200-800ms → tổng thời gian thất bại ≈ 3-4 giây.
+ *   b) lastAttemptTime được ghi lúc BẮT ĐẦU lần thử. Khi finish(false) được
+ *      gọi sau 3-4 giây, elapsed đã ≥ cooldown (3s) → cooldown KHÔNG chặn được!
+ *   c) Kết quả: mỗi lần claimInterface fail → conn.close() → Android re-enum →
+ *      ATTACHED → requestAndOpen() bypass cooldown → fail → loop vô tận.
  *
- *   Giải pháp: Ghi timestamp lần thử cuối. Nếu lần thử gần nhất < 3 giây
- *   trước VÀ thất bại, từ chối ngay (không mở dialog quyền, không gọi open).
- *   Kết quả: vòng lặp tự dừng sau một lần fail, không spam log nữa.
+ * Fix (2 thay đổi):
+ *   1. Trong finish(false), RESET lastAttemptTime = System.currentTimeMillis().
+ *      Cooldown bây giờ tính từ lúc THẤT BẠI được ghi nhận, không phải lúc bắt đầu.
+ *   2. Tăng cooldown từ 3s lên 8s — đủ dài để Android hoàn tất re-enumerate
+ *      và ATTACHED event được xử lý, nhưng không quá lâu để UX chịu được.
+ * ═══════════════════════════════════════════════════════════════════
  */
 object UsbPermissionManager {
     private const val ACTION_USB_PERMISSION = "com.superalpha.sideload.USB_PERMISSION"
 
-    // Cooldown giữa các lần thử tự động (ms) — ngăn vòng lặp ATTACHED → fail → ATTACHED
-    private const val AUTO_CONNECT_COOLDOWN_MS = 3_000L
+    /** Cooldown SAU KHI thất bại (ms) — ngăn vòng lặp ATTACHED → fail → ATTACHED */
+    private const val AUTO_CONNECT_COOLDOWN_MS = 8_000L
 
-    // Thời điểm lần thử gần nhất (System.currentTimeMillis())
-    private val lastAttemptTime = AtomicLong(0L)
-    // Kết quả lần thử cuối: true = thành công, false = thất bại
-    @Volatile private var lastAttemptSucceeded = false
+    /**
+     * Thời điểm THẤT BẠI gần nhất được ghi nhận (System.currentTimeMillis()).
+     * BẮT ĐẦU LÚC 0 → never failed → elapsed luôn lớn → lần đầu tiên luôn được thử.
+     * Được RESET về now() trong finish(false) — không phải lúc bắt đầu lần thử.
+     */
+    private val lastFailTimestampMs = AtomicLong(0L)
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
     @Volatile private var requestInFlight = false
     @Volatile private var pendingReceiver: BroadcastReceiver? = null
 
-    /**
-     * Publishes the connected device's USB serial number (== UDID for essentially every
-     * iPhone/iPad) into [AppConfig.lastUdid].
-     */
     private fun publishUdid(device: UsbDevice) {
         val serial = try { device.serialNumber } catch (_: Exception) { null }
         if (!serial.isNullOrBlank()) {
@@ -65,25 +69,29 @@ object UsbPermissionManager {
     /**
      * Tìm thiết bị Apple, xin quyền (hoặc mở ngay nếu đã có quyền), gọi [onResult].
      *
-     * @param fromAutoAttach true nếu được gọi từ USB_DEVICE_ATTACHED intent (auto-connect).
-     *   Khi đó áp dụng cooldown 3 giây để tránh vòng lặp.
-     *   false khi người dùng bấm "Kết nối" thủ công — bỏ qua cooldown.
+     * @param fromAutoAttach true khi gọi từ USB_DEVICE_ATTACHED (auto-connect) →
+     *   áp dụng cooldown 8 giây sau thất bại để tránh vòng lặp.
+     *   false khi người dùng bấm "Kết nối" thủ công → bỏ qua cooldown.
      */
     fun requestAndOpen(
         context: Context,
         fromAutoAttach: Boolean = false,
-        onResult: (Boolean, String) -> Unit
+        onResult: (Boolean, String) -> Unit = { _, _ -> }
     ) {
-        // FIX: Kiểm tra cooldown khi gọi từ auto-attach (không áp dụng khi bấm tay)
+        // ── Cooldown check (chỉ áp dụng cho auto-attach) ───────────────────────
         if (fromAutoAttach) {
-            val now = System.currentTimeMillis()
-            val elapsed = now - lastAttemptTime.get()
-            if (!lastAttemptSucceeded && elapsed < AUTO_CONNECT_COOLDOWN_MS) {
-                // Còn trong cooldown sau lần fail trước — bỏ qua để tránh vòng lặp
+            val elapsed = System.currentTimeMillis() - lastFailTimestampMs.get()
+            if (elapsed < AUTO_CONNECT_COOLDOWN_MS) {
+                // Còn trong 8 giây sau lần fail cuối → bỏ qua hoàn toàn
+                NativeLog.emit(
+                    "[usb] Bỏ qua auto-connect: cooldown ${AUTO_CONNECT_COOLDOWN_MS / 1000}s " +
+                    "sau thất bại (còn ${(AUTO_CONNECT_COOLDOWN_MS - elapsed) / 1000}s)."
+                )
                 return
             }
         }
 
+        // ── Guard: Chỉ một lần thử tại một thời điểm ──────────────────────────
         if (requestInFlight) {
             if (!fromAutoAttach) {
                 onResult(false, "Đang xử lý yêu cầu kết nối trước đó — vui lòng đợi một chút rồi thử lại.")
@@ -91,11 +99,19 @@ object UsbPermissionManager {
             return
         }
         requestInFlight = true
-        lastAttemptTime.set(System.currentTimeMillis())
 
         val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+        /** Kết thúc một lần thử.
+         *  QUAN TRỌNG: Nếu fail, reset lastFailTimestampMs = NOW để cooldown
+         *  tính từ thời điểm thất bại được ghi nhận, không phải lúc bắt đầu lần thử.
+         *  Nếu không reset ở đây, vòng lặp retry (3-4 giây) làm cho cooldown đã
+         *  hết hạn ngay khi finish() được gọi. */
         fun finish(ok: Boolean, msg: String) {
-            lastAttemptSucceeded = ok
+            if (!ok) {
+                // ← FIX CHÍNH: Reset cooldown timer TẠI THỜI ĐIỂM THẤT BẠI
+                lastFailTimestampMs.set(System.currentTimeMillis())
+            }
             requestInFlight = false
             mainHandler.post { onResult(ok, msg) }
         }
@@ -116,7 +132,7 @@ object UsbPermissionManager {
             return
         }
 
-        // Gỡ receiver cũ nếu còn treo
+        // ── Xin quyền USB (system dialog) ─────────────────────────────────────
         pendingReceiver?.let {
             try { context.unregisterReceiver(it) } catch (_: Exception) {}
             pendingReceiver = null

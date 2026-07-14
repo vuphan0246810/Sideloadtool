@@ -12,17 +12,10 @@ import org.json.JSONObject
 /**
  * PythonBridge — cầu nối Kotlin ↔ Python (Chaquopy).
  *
- * v8: Khôi phục Chaquopy cho các hàm Apple API:
- *   - revokeCerts() → sideload_core.do_revoke_certs()
- *                     (Python HTTP thuần, KHÔNG cần USB — hàm này hoàn toàn
- *                     giao tiếp với Apple qua HTTPS, không đụng đến thiết bị iOS)
- *   - sideload()    → sideload_core.do_sideload()
- *                     (Python xử lý auth + signing; USB đi qua DeviceNative → native C)
- *   - listAnisetteServers() → vẫn dùng Kotlin OkHttp (đã port từ v7)
- *
- * Chỉ mux_usb.py và device_link.py được port sang native C.
- * apple_auth.py, developer_api.py, sideload_core.py, config_manager.py, utils.py
- * vẫn chạy hoàn toàn bằng Python qua Chaquopy.
+ * v9: Sửa log Python đầy đủ:
+ *   - Exception từ Chaquopy có message nhiều dòng (Python traceback).
+ *     Phát từng dòng riêng để LogConsole hiển thị đầy đủ.
+ *   - Thêm NativeLog.emit() cho từng bước quan trọng để người dùng thấy tiến độ.
  */
 object PythonBridge {
     data class AnisetteServer(val name: String, val address: String)
@@ -30,24 +23,34 @@ object PythonBridge {
 
     private val httpClient by lazy { OkHttpClient() }
 
-    // ── Config helpers (đọc/ghi từ AppConfig, không cần Python) ─────────────
     fun getSavedAppleId(): String = AppConfig.appleId
     fun saveAppleId(v: String) { AppConfig.appleId = v }
     fun getSavedAnisetteUrl(): String = AppConfig.anisetteUrl
     fun saveAnisetteUrl(v: String) { AppConfig.anisetteUrl = v }
 
-    // ── Python module helper ─────────────────────────────────────────────────
     private fun pythonModule(name: String) = Python.getInstance().getModule(name)
 
     /**
+     * Emit toàn bộ exception (có thể nhiều dòng traceback) ra NativeLog.
+     * Chia theo \n để LogConsole không bị cụt dòng.
+     */
+    private fun emitException(prefix: String, e: Exception) {
+        val full = buildString {
+            append(e.javaClass.simpleName)
+            val msg = e.message
+            if (!msg.isNullOrBlank()) {
+                append(": ")
+                append(msg)
+            }
+        }
+        full.lines().forEach { line ->
+            if (line.isNotBlank()) NativeLog.emit("$prefix $line")
+        }
+    }
+
+    /**
      * Thu hồi chứng chỉ Development bằng Apple ID.
-     *
-     * Gọi sideload_core.do_revoke_certs(apple_id, password, anisette_url, cert_selector).
-     * Hàm Python này chỉ dùng HTTP (apple_auth + developer_api) — không cần USB/device.
-     *
-     * Chữ ký Python:
-     *   do_revoke_certs(apple_id: str, password: str,
-     *                   anisette_url: str = "", cert_selector: str = "") -> bool
+     * Gọi sideload_core.do_revoke_certs() — hàm Python chỉ dùng HTTP, không cần USB.
      */
     suspend fun revokeCerts(
         appleId: String,
@@ -58,10 +61,8 @@ object PythonBridge {
         try {
             NativeLog.emit("[python] Đang đăng nhập & tra cứu chứng chỉ...")
             val core = pythonModule("sideload_core")
-            // Lưu apple_id để tự điền lần sau
             AppConfig.appleId = appleId
             val effectiveAnisetteUrl = anisetteUrl?.takeIf { it.isNotBlank() } ?: ""
-            // Đúng thứ tự tham số Python: apple_id, password, anisette_url, cert_selector
             val ok = core.callAttr(
                 "do_revoke_certs",
                 appleId,
@@ -71,22 +72,14 @@ object PythonBridge {
             ).toBoolean()
             Outcome(ok, if (ok) "Thu hồi chứng chỉ thành công." else "Thu hồi thất bại — xem nhật ký.")
         } catch (e: Exception) {
-            val msg = e.message ?: e.toString()
-            NativeLog.emit("[python] ❌ revokeCerts lỗi: $msg")
-            Outcome(false, msg)
+            emitException("[python] ❌ revokeCerts lỗi:", e)
+            Outcome(false, e.message?.lines()?.firstOrNull { it.isNotBlank() } ?: e.toString())
         }
     }
 
     /**
      * Ký và cài đặt IPA bằng Apple ID.
-     *
-     * Gọi sideload_core.do_sideload() trong Python:
-     *   - Python xử lý: auth Apple ID, tạo/tái sử dụng cert & App ID, ký IPA (zsign)
-     *   - Native C xử lý: USB connect, lockdown pair, AFC push, install_proxy
-     *     (thông qua DeviceNative.kt được gọi từ device_link.py wrapper)
-     *
-     * Chữ ký Python:
-     *   do_sideload(ipa_path, apple_id, password, udid_override="", anisette_url="") -> bool
+     * Python xử lý: auth, cert, signing. Native C xử lý USB qua DeviceNative.
      */
     suspend fun sideload(
         ipaPath: String,
@@ -110,14 +103,13 @@ object PythonBridge {
             ).toBoolean()
             Outcome(ok, if (ok) "Cài đặt IPA thành công." else "Cài đặt thất bại — xem nhật ký.")
         } catch (e: Exception) {
-            val msg = e.message ?: e.toString()
-            NativeLog.emit("[python] ❌ sideload lỗi: $msg")
-            Outcome(false, msg)
+            emitException("[python] ❌ sideload lỗi:", e)
+            Outcome(false, e.message?.lines()?.firstOrNull { it.isNotBlank() } ?: e.toString())
         }
     }
 
     /**
-     * Danh sách server Anisette công khai — dùng Kotlin OkHttp (không cần Python).
+     * Danh sách server Anisette công khai — Kotlin OkHttp, không cần Python.
      */
     suspend fun listAnisetteServers(): List<AnisetteServer> = withContext(Dispatchers.IO) {
         try {
