@@ -364,7 +364,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSideload(
     snprintf(log_buf, sizeof(log_buf), "[afc] Push IPA → %s ...", remote_path);
     jni_log(env, log_buf);
 
-    if (afc_push_file(&afc, ipa_path, remote_path) < 0) {
+    if (afc_push_file(&afc, ipa_path, remote_path, NULL) < 0) {
         jni_log(env, "[afc] \u274c Push IPA thất bại");
         (*env)->ReleaseStringUTFChars(env, j_ipa_path, ipa_path);
         return JNI_FALSE;
@@ -396,7 +396,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSideload(
     snprintf(log_buf, sizeof(log_buf), "[install] Cài đặt %s ...", remote_path);
     jni_log(env, log_buf);
 
-    if (install_proxy_install(&ip, remote_path) < 0) {
+    if (install_proxy_install(&ip, remote_path, NULL) < 0) {
         jni_log(env, "[install] \u274c Cài đặt thất bại");
         (*env)->ReleaseStringUTFChars(env, j_ipa_path, ipa_path);
         return JNI_FALSE;

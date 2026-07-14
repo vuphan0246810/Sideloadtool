@@ -1,144 +1,136 @@
-# Changelog — Lần 2: Sửa triệt để lỗi Trust popup
+# Changelog — BUGFIX v17 (Sideloadtool)
 
-## Tóm tắt nhanh
+## Vấn đề gốc rễ: "SETUP thất bại"
 
-| # | File | Nghiêm trọng | Mô tả |
-|---|------|--------------|--------|
-| 1 | mux_usb.py | 🔴 CHÍNH | seq=0, SYN+1, FIN+1 — TCP sequence đúng |
-| 2 | device_link.py | 🔴 CHÍNH | DER cert thay PEM trong PairRecord gửi thiết bị |
-| 3 | **mux_usb.py** | 🔴 **MỚI** | **MuxDevice singleton không reset giữa các lần chạy** |
-| 4 | **sideload_core.py** | 🔴 **MỚI** | **Pair record cũ/hỏng không được kiểm tra → bỏ qua pairing** |
-| 5 | device_link.py | 🟠 MỚI | Timeout `_request` 15s → 30s |
-| 6 | device_link.py | 🟠 MỚI | `PasswordProtected` chưa xử lý (iPhone đang khoá) |
-| 7 | device_link.py | 🟠 MỚI | DevicePublicKey: chỉ thử PEM, không thử DER nếu PEM lỗi |
-| 8 | mux_usb.py | 🟡 MỚI | Pump loop không unblock recv() khi USB bị rút |
-| 9 | sideload_core.py | 🟡 MỚI | Thiếu hàm `delete_pair_record()` để force re-pair |
-| 10 | device_link.py | 🟡 C1 | PairingDialogResponsePending retry (iOS 13+) |
-| 11 | device_link.py | 🟡 C1 | 60s timeout chờ Trust response |
-
----
-
-## Chi tiết các lỗi MỚI (lần này)
-
----
-
-### 🔴 Lỗi 3 (NGUYÊN NHÂN CHÍNH của lần 2): MuxDevice singleton không reset
-
-**File:** `mux_usb.py` → `sideload_core.py`
-
-**Triệu chứng:** Sau khi sideload thất bại lần đầu (hoặc iPhone rút-cắm lại),
-bấm "Sideload" lần 2 → Trust popup không xuất hiện, mọi request đều timeout.
-
-**Nguyên nhân kỹ thuật:**
-- `MuxDevice` là **singleton toàn cục** trong Python process.
-- Lần chạy đầu: singleton được tạo, `start()` thực hiện **version handshake**,
-  pump thread bắt đầu chạy → trạng thái `_version=2`.
-- Lần chạy thứ 2 (kể cả sau khi rút/cắm lại cáp USB):
-  - `get_device()` trả về **singleton cũ** (không tạo lại).
-  - Pump thread từ lần 1 vẫn đang chạy, đang consume dữ liệu USB.
-  - Thiết bị vừa reconnect → cần **version handshake mới**.
-  - Code nhảy thẳng vào gửi SYN với **16-byte full header** (`_version=2`)
-    trong khi thiết bị đang chờ **8-byte short header** của version handshake.
-  - → Giao thức lệch ngay từ byte đầu tiên → mọi request bị thiết bị bỏ qua.
-
-**Sửa (`sideload_core.py`):**
-```python
-# Gọi đầu tiên trong do_sideload() trước mọi thứ khác
-device_link.reset_mux_device()   # ← reset singleton, dừng pump thread cũ
+```
+[mux] Gửi SETUP packet...
+[mux] ❌ SETUP thất bại
+[pairing] ❌ Không kết nối được USB — kiểm tra cáp/quyền USB.
 ```
 
-**Sửa (`device_link.py`):**
-```python
-def reset_mux_device():
-    from mux_usb import reset_device as _mux_reset
-    _mux_reset()
+USB hiển thị "kết nối xanh ✓" nhưng bắt tay usbmux SETUP vẫn thất bại.  
+Nguyên nhân thực sự **KHÔNG phải** dây cáp hay quyền USB — mà là lỗi lập trình.
+
+---
+
+## Lỗi 1 (Nghiêm trọng nhất) — USB Read Fragmentation
+
+**File:** `app/src/main/cpp/usbmux.c` + `usbmux.h`
+
+### Nguyên nhân
+
+`recv_packet()` cũ đọc USB theo **2 bước riêng biệt**:
+1. Đọc 8 byte (lấy header để biết tổng độ dài)
+2. Đọc `total − 8` byte (đọc phần còn lại của packet)
+
+Nhưng iPhone gửi toàn bộ VERSION response (ví dụ 20 byte) như **một USB bulk transfer duy nhất**.  
+Android `bulkTransfer(buf, 8, timeout)` chỉ trả về 8 byte và **CẮT BỎ 12 byte còn lại**  
+— Android USB Host driver KHÔNG buffer phần dư khi buffer yêu cầu nhỏ hơn dữ liệu nhận được.  
+
+Lần `usb_read` tiếp theo (đọc 12 byte body) gửi IN token mới tới iPhone, nhưng iPhone đã  
+gửi xong → **timeout → `recv_packet` trả NULL → `mux_do_setup` thất bại → "SETUP thất bại"**.
+
+Đây là cách `usbmuxd/src/device.c` chính thức (Apple's daemon trên macOS/Linux) hoạt động:  
+nó định nghĩa `DEV_MRU = 65536` và đọc vào `pktbuf` tối đa 65536 byte mỗi lần, **không bao giờ đọc 2 bước**.
+
+### Fix
+
+Thêm **read-ahead buffer** vào `mux_conn_t`:
+```c
+uint8_t  rxbuf[65536];   // MUX_DEV_MRU — khớp DEV_MRU trong usbmuxd/src/device.c
+int      rxbuf_used;
+int      rxbuf_pos;
 ```
 
+`buffered_read()` mới: khi buffer cạn, đọc tối đa `MUX_DEV_MRU` byte từ USB vào `rxbuf`  
+trong **một lần gọi duy nhất**, rồi phục vụ các yêu cầu nhỏ hơn từ buffer đó.  
+`recv_packet()` được sửa để dùng `buffered_read()` thay vì `read_all()` trực tiếp.
+
+**Files thay đổi:**
+- `app/src/main/cpp/usbmux.h` — thêm `rxbuf[65536]`, `rxbuf_used`, `rxbuf_pos`, `ui_log` vào `mux_conn_t`; thêm hằng `MUX_DEV_MRU 65536`
+- `app/src/main/cpp/usbmux.c` — thêm `buffered_read()`; sửa `recv_packet()` dùng `buffered_read()`; sửa `mux_conn_init()` khởi tạo các trường mới
+
 ---
 
-### 🔴 Lỗi 4 (NGUYÊN NHÂN CHÍNH của lần 2): Pair record hỏng bỏ qua pairing
+## Lỗi 2 — UI log mơ hồ, thiếu chi tiết
 
-**File:** `sideload_core.py`
+**File:** `app/src/main/cpp/jni_bridge.c` + `usbmux.h` + `usbmux.c`
 
-**Triệu chứng:** Trust popup không xuất hiện ngay cả khi iPhone kết nối lần đầu.
+### Nguyên nhân
 
-**Nguyên nhân kỹ thuật:**
-- Nếu một lần ghép nối trước đó **bắt đầu thành công nhưng không hoàn thành**
-  (ví dụ: iOS trả `{"Result": "Success"}` không có `EscrowBag`, hoặc app crash
-  sau khi ghi file), một `pair_record.plist` **không hợp lệ** vẫn được lưu.
-- `_get_or_create_pair_record()` **load và trả về ngay** mà không kiểm tra.
-- → `pair_device()` không bao giờ được gọi → Trust popup không bao giờ xuất hiện.
+`mux_do_setup()` chỉ ghi log vào Logcat (`LOGI/LOGE`) — không hiện trên UI.  
+`jni_bridge.c` chỉ ghi `"[mux] Gửi SETUP packet..."` (sai — thực ra bước đầu là VERSION, không phải SETUP)  
+và chỉ ghi `"[mux] ❌ SETUP thất bại"` khi thất bại — không biết bước nào bị lỗi.
 
-**Sửa:**
-```python
-def _get_or_create_pair_record(udid):
-    record = _load_pair_record()
-    if record:
-        if device_link.validate_pair_record(record):   # ← KIỂM TRA trước khi dùng
-            return record
-        delete_pair_record()   # ← XÓA nếu hỏng
-    # ... gọi pair_device() bình thường
+### Fix
+
+Thêm `void (*ui_log)(const char *msg)` callback vào `mux_conn_t`.  
+`mux_do_setup()` gọi `UI_LOG()` macro để ghi log lên **cả Logcat và UI** cho từng bước:
+- `[mux] Gửi VERSION packet (major=2 minor=0)...`
+- `[mux] Đã gửi VERSION, đang chờ phản hồi từ iPhone...`
+- `[mux] ✅ Thiết bị chấp nhận usbmux v2.0`
+- `[mux] Gửi SETUP packet (protocol=2, payload=0x07)...`
+- `[mux] ✅ SETUP hoàn tất (...)`
+
+`jni_bridge.c` gắn `g_mux.ui_log = jni_log_ui_cb` sau `mux_conn_init()`.  
+`jni_log_ui_cb()` là static function lấy `JNIEnv` từ `g_jvm` và gọi `NativeBridge.onNativeLog()`.
+
+**Files thay đổi:**
+- `app/src/main/cpp/usbmux.h` — thêm `void (*ui_log)(const char *msg)` vào `mux_conn_t`
+- `app/src/main/cpp/usbmux.c` — thêm macro `UI_LOG(c, msg)`; sửa `mux_do_setup()` dùng `UI_LOG`
+- `app/src/main/cpp/jni_bridge.c` — thêm `jni_log_ui_cb()`; gắn `g_mux.ui_log = jni_log_ui_cb` sau `mux_conn_init()`; sửa text log trong `nativeConnect()` cho chính xác
+
+---
+
+## Lỗi 3 — JNI local ref leak
+
+**File:** `app/src/main/cpp/jni_bridge.c`
+
+### Nguyên nhân
+
+`usb_bulk_write()` và `usb_bulk_read()`:
+```c
+jmethodID mid = (*env)->GetStaticMethodID(env, cls, ...);
+if (!mid) return -1;  // ← thiếu DeleteLocalRef(env, cls)!
 ```
+`cls` local ref bị rò khi `GetStaticMethodID()` thất bại.
 
-`validate_pair_record()` kiểm tra: `HostID`, `HostCertificate`, `HostPrivateKey`,
-`RootCertificate`, `RootPrivateKey`, `SystemBUID` đều có mặt và không rỗng,
-**VÀ** `EscrowBag` tồn tại (bắt buộc cho iOS 7+).
+### Fix
 
----
-
-### 🟠 Lỗi 5: `_request` timeout cứng 15s
-
-**Sửa:** `def _request(self, request: dict, timeout: float = 30.0)` — mỗi `GetValue`
-request bây giờ chờ 30s thay vì 15s.
+Thêm `(*env)->DeleteLocalRef(env, cls)` trước `return -1` trong tất cả nhánh lỗi.  
+Cũng thêm kiểm tra `NewByteArray()` trả NULL (OOM) với cleanup đầy đủ.
 
 ---
 
-### 🟠 Lỗi 6: `PasswordProtected` không được xử lý
+## Lỗi 4 — Nút "Kết nối & Ghép nối" không mở USB trước khi pair
 
-**Triệu chứng:** iPhone đang khoá bằng mã PIN → lockdownd trả `PasswordProtected`
-→ app báo lỗi chung chung "Pairing thất bại", không hướng dẫn người dùng.
+**File:** `app/src/main/java/com/superalpha/sideload/ui/PairingScreen.kt`
 
-**Sửa:** Thêm case `PasswordProtected` với thông báo rõ ràng bằng tiếng Việt.
+### Nguyên nhân
 
----
+Nút gọi `viewModel.connectAndPair()` trực tiếp. Nếu người dùng **mở app trước khi cắm cáp**  
+rồi cắm cáp rồi bấm nút — `UsbTransport` chưa được mở (`endpointOut == null`).  
+`usb_bulk_write()` trả `-1` ngay → VERSION packet không gửi được → "SETUP thất bại".
 
-### 🟠 Lỗi 7: DevicePublicKey không có DER fallback
+### Fix
 
-Nếu thiết bị trả DER thay vì PEM, `load_pem_public_key()` ném ValueError và
-toàn bộ pairing crash ngay. **Sửa:** thử PEM trước, nếu lỗi thử DER.
+Nút kiểm tra `usbConnected`:
+- `usbConnected == true` → gọi `connectAndPair()` ngay
+- `usbConnected == false` → gọi `UsbPermissionManager.requestAndOpen()` trước;  
+  chỉ khi callback `ok == true` mới gọi `connectAndPair()`.  
+  Người dùng thấy log rõ ràng về từng bước.
 
----
-
-### 🟡 Lỗi 8: Pump loop không unblock recv() khi USB rút
-
-**Sửa:** Sau 20 lần timeout liên tiếp (100s), pump loop đóng tất cả kết nối
-đang mở để `recv()` trên main thread nhận được EOF thay vì chờ 60s.
-
----
-
-### 🟡 Lỗi 9: Thiếu hàm `delete_pair_record()`
-
-**Sửa:** Thêm hàm `delete_pair_record()` trong `sideload_core.py`. Gọi từ Kotlin
-qua `PythonBridge` khi người dùng cần force re-pair:
-
-```kotlin
-// Thêm vào PythonBridge.kt nếu muốn có nút "Ghép nối lại iPhone" trong UI:
-fun deletePairRecord(): Boolean = callPython("delete_pair_record")
-```
+**Files thay đổi:**
+- `app/src/main/java/com/superalpha/sideload/ui/PairingScreen.kt`
+- `app/src/main/java/com/superalpha/sideload/ui/HomeViewModel.kt` — thêm `emitLog()` helper
 
 ---
 
-## Hướng dẫn Debug khi Trust popup không xuất hiện
+## Bảng tóm tắt
 
-Kiểm tra log theo thứ tự:
-
-1. **`[mux] Bắt tay phiên bản usbmux...`** → mux TCP handshake đang chạy
-2. **`[mux] Thiết bị chấp nhận phiên bản usbmux 2.0`** → USB OK
-3. **`[pairing] Bắt đầu ghép nối lần đầu...`** → pair_record.plist không tồn tại hoặc đã bị xóa
-4. **`[pairing] Đang gửi yêu cầu ghép nối...`** → Pair request đã được gửi
-5. **`[pairing] *** Kiểm tra màn hình iPhone ***`** → XEM MÀTN HÌNH IPHONE NGAY LÚC NÀY
-6. Nếu thấy **`[pairing] ✅ Đã ghép nối thành công`** nhưng không thấy popup:
-   → iPhone đã trust từ trước (profile còn hạn) — đây không phải lỗi!
-
-Nếu thấy **`[pairing] ✅ Đã ghép nối trước đó — dùng lại pair record`**:
-→ Ghép nối đã xong từ trước. Trust popup chỉ xuất hiện lần đầu tiên.
+| # | File | Mức độ | Fix |
+|---|------|--------|-----|
+| 1 | `usbmux.c` / `usbmux.h` | **CRITICAL** | Thêm read-ahead buffer 65536 byte, `buffered_read()` |
+| 2 | `jni_bridge.c` / `usbmux.c` | HIGH | UI log callback `ui_log`; log chi tiết từng bước VERSION/SETUP |
+| 3 | `jni_bridge.c` | MEDIUM | Fix JNI local ref leak trong `usb_bulk_write/read` |
+| 4 | `PairingScreen.kt` / `HomeViewModel.kt` | MEDIUM | Mở USB trước khi pair nếu chưa kết nối |
