@@ -1,6 +1,5 @@
 package com.superalpha.sideload.ui
 
-import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -15,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -27,17 +27,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
-import com.superalpha.sideload.bridge.NativeLog
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.runtime.collectAsState
 import com.superalpha.sideload.bridge.NativeBridge
-import com.superalpha.sideload.bridge.UiPrompt
+import com.superalpha.sideload.bridge.NativeLog
 import com.superalpha.sideload.bridge.UsbPermissionManager
 import com.superalpha.sideload.python.PythonBridge
 import kotlinx.coroutines.launch
@@ -46,7 +42,14 @@ import java.io.FileOutputStream
 
 /**
  * Main "sideload an IPA" flow: pick a file, connect USB, enter Apple ID, run.
- * Mirrors main.py's option 1 ("Ký và cài đặt IPA") from the original CLI tool.
+ *
+ * FIX: Nút "Ký & Cài đặt" bây giờ yêu cầu USB đã kết nối.
+ * Root cause: PythonBridge.sideload() gọi device_link.pair_device() →
+ * DeviceNative.connectAndPair() → NativeBridge.connect() → native C code
+ * gọi UsbTransport.nativeBulkWrite/Read. Nếu UsbTransport chưa có connection
+ * (connection == null), bulk I/O trả -1 → native connect thất bại ngay.
+ * Fix: vô hiệu hoá nút "Ký & Cài đặt" khi chưa có USB; hướng dẫn người dùng
+ * bấm "Kết nối" trước.
  */
 @Composable
 fun SideloadScreen(viewModel: HomeViewModel) {
@@ -65,8 +68,6 @@ fun SideloadScreen(viewModel: HomeViewModel) {
     var appleIdPrefilled by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
 
-    // Tự điền Apple ID đã lưu trong Cài đặt, một lần duy nhất khi có giá trị
-    // (không đè lên nếu người dùng đã tự gõ gì đó trước khi giá trị lưu tải xong).
     androidx.compose.runtime.LaunchedEffect(savedAppleId) {
         if (!appleIdPrefilled && savedAppleId.isNotBlank()) {
             if (appleId.isBlank()) appleId = savedAppleId
@@ -74,10 +75,10 @@ fun SideloadScreen(viewModel: HomeViewModel) {
         }
     }
 
-    val pickIpaLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+    val pickIpaLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
-        // sideload_core.py / zsign need a real filesystem path, not a content:// Uri,
-        // so copy the picked file into app-private storage first.
         val dest = File(context.filesDir, "picked.ipa")
         context.contentResolver.openInputStream(uri)?.use { input ->
             FileOutputStream(dest).use { output -> input.copyTo(output) }
@@ -88,7 +89,8 @@ fun SideloadScreen(viewModel: HomeViewModel) {
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        // Trust banner — hiển thị khi C native cần người dùng bấm Trust trên iPhone
+
+        // ── Trust banner ───────────────────────────────────────────────────────
         if (trustRequired) {
             androidx.compose.material3.Card(
                 modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
@@ -104,24 +106,53 @@ fun SideloadScreen(viewModel: HomeViewModel) {
                 )
             }
         }
-        Text("Cài đặt ứng dụng (.ipa) lên iPhone", style = androidx.compose.material3.MaterialTheme.typography.titleLarge)
+
+        Text(
+            "Cài đặt ứng dụng (.ipa) lên iPhone",
+            style = MaterialTheme.typography.titleLarge
+        )
         Spacer(Modifier.height(12.dp))
 
-        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-            Icon(Icons.Filled.Usb, contentDescription = null, tint = if (usbConnected) com.superalpha.sideload.ui.theme.BrandAccent else com.superalpha.sideload.ui.theme.BrandTextDim)
-            Spacer(Modifier.height(0.dp))
+        // ── USB status + Kết nối button ─────────────────────────────────────
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Filled.Usb,
+                contentDescription = null,
+                tint = if (usbConnected)
+                    com.superalpha.sideload.ui.theme.BrandAccent
+                else
+                    com.superalpha.sideload.ui.theme.BrandTextDim
+            )
             Text(
                 text = if (usbConnected) "Đã kết nối iPhone qua USB" else "Chưa kết nối USB",
                 modifier = Modifier.padding(start = 8.dp)
             )
             Spacer(Modifier.weight(1f))
+            // fromAutoAttach=false → bỏ qua cooldown khi người dùng bấm tay
             TextButton(onClick = {
-                UsbPermissionManager.requestAndOpen(context) { ok, msg -> NativeLog.log(msg) }
+                UsbPermissionManager.requestAndOpen(
+                    context,
+                    fromAutoAttach = false
+                ) { _, msg -> NativeLog.log(msg) }
             }) { Text("Kết nối") }
         }
 
+        // FIX: Hiển thị hướng dẫn kết nối USB khi chưa có kết nối
+        if (!usbConnected) {
+            Text(
+                text = "⚠ Vui lòng cắm cáp USB và bấm \"Kết nối\" trước khi ký & cài đặt.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+
         Spacer(Modifier.height(16.dp))
-        Button(onClick = { pickIpaLauncher.launch(arrayOf("application/octet-stream", "*/*")) }, modifier = Modifier.fillMaxWidth()) {
+
+        Button(
+            onClick = { pickIpaLauncher.launch(arrayOf("application/octet-stream", "*/*")) },
+            modifier = Modifier.fillMaxWidth()
+        ) {
             Text(ipaName)
         }
 
@@ -139,9 +170,19 @@ fun SideloadScreen(viewModel: HomeViewModel) {
         )
 
         Spacer(Modifier.height(16.dp))
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
             Button(
-                enabled = !busy && ipaPath != null && appleId.isNotBlank() && password.isNotBlank(),
+                // FIX: Thêm điều kiện usbConnected — không cho phép ký khi USB chưa kết nối
+                // vì Python sẽ gọi DeviceNative.connectAndPair() ngay trong do_sideload()
+                // và sẽ thất bại nếu UsbTransport.connection == null
+                enabled = !busy
+                    && usbConnected
+                    && ipaPath != null
+                    && appleId.isNotBlank()
+                    && password.isNotBlank(),
                 onClick = {
                     val path = ipaPath ?: return@Button
                     viewModel.setBusy(true)
@@ -159,7 +200,10 @@ fun SideloadScreen(viewModel: HomeViewModel) {
                 }
             ) {
                 if (busy) {
-                    CircularProgressIndicator(modifier = Modifier.height(16.dp), strokeWidth = 2.dp)
+                    CircularProgressIndicator(
+                        modifier = Modifier.height(16.dp),
+                        strokeWidth = 2.dp
+                    )
                 } else {
                     Text("Ký & Cài đặt")
                 }
@@ -168,7 +212,7 @@ fun SideloadScreen(viewModel: HomeViewModel) {
         }
 
         Spacer(Modifier.height(12.dp))
-        Text("Nhật ký:", style = androidx.compose.material3.MaterialTheme.typography.labelLarge)
+        Text("Nhật ký:", style = MaterialTheme.typography.labelLarge)
         Spacer(Modifier.height(4.dp))
         LogConsole(lines = logLines, modifier = Modifier.weight(1f))
     }

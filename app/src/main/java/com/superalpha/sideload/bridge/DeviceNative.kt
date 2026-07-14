@@ -12,8 +12,14 @@ import kotlinx.coroutines.runBlocking
  *   - device_link.py gọi các thao tác USB/lockdown (đã port sang native C)
  *   - Python code không cần import bất cứ thứ gì từ mux_usb.py / device_link.py cũ
  *
- * Chỉ USB/lockdown là native — apple_auth.py, developer_api.py, sideload_core.py
- * vẫn chạy bình thường trong Python qua Chaquopy.
+ * FIX: Thêm kiểm tra UsbTransport.isConnected() trước khi gọi native C.
+ *
+ * Root cause Python "không thấy" USB:
+ *   nativeConnect() ở C gọi usb_bulk_write/read → UsbTransport.nativeBulkWrite/Read.
+ *   Nếu UsbTransport chưa kết nối (connection == null), bulk I/O trả -1 ngay,
+ *   C code không có thông báo rõ ràng — Python nhận LockdownError mơ hồ.
+ *   Fix: kiểm tra UsbTransport.isConnected() TRƯỚC khi gọi native; nếu chưa kết nối
+ *   emit thông báo rõ ràng bằng tiếng Việt và trả false ngay.
  */
 object DeviceNative {
     @Volatile private var bridge: NativeBridge? = null
@@ -35,14 +41,26 @@ object DeviceNative {
             NativeLog.emit("[DeviceNative] ❌ Chưa init — gọi DeviceNative.init() trước.")
             return@runBlocking false
         }
-        val connected = b.connect()
-        if (!connected) {
-            NativeLog.emit("[DeviceNative] ❌ connect() thất bại.")
+
+        // FIX: Kiểm tra USB đã được kết nối qua UsbTransport chưa.
+        // Nếu chưa, native C sẽ thất bại ngay vì usb_bulk_write/read trả -1.
+        // Phát thông báo rõ ràng để log hiện hướng dẫn cụ thể cho người dùng.
+        if (!UsbTransport.isConnected()) {
+            NativeLog.emit(
+                "[DeviceNative] ❌ USB chưa kết nối — vui lòng cắm cáp và bấm \"Kết nối\" trước."
+            )
             return@runBlocking false
         }
+
+        val connected = b.connect()
+        if (!connected) {
+            NativeLog.emit("[DeviceNative] ❌ connect() thất bại — kiểm tra cáp USB và thiết bị đã mở khoá.")
+            return@runBlocking false
+        }
+
         val paired = b.pair()
         if (!paired) {
-            NativeLog.emit("[DeviceNative] ❌ pair() thất bại.")
+            NativeLog.emit("[DeviceNative] ❌ pair() thất bại — nếu iPhone hỏi \"Tin cậy?\" hãy bấm Tin cậy.")
         }
         paired
     }
@@ -65,6 +83,10 @@ object DeviceNative {
     fun sideloadIpa(localIpaPath: String): Boolean = runBlocking {
         val b = bridge ?: run {
             NativeLog.emit("[DeviceNative] ❌ Chưa init.")
+            return@runBlocking false
+        }
+        if (!UsbTransport.isConnected()) {
+            NativeLog.emit("[DeviceNative] ❌ USB đã ngắt trong quá trình cài đặt — thử lại từ đầu.")
             return@runBlocking false
         }
         b.sideload(localIpaPath)

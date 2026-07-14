@@ -36,12 +36,10 @@ class MainActivity : ComponentActivity() {
         handleUsbAttachIntent(intent)
     }
 
-    // launchMode="singleTop" (AndroidManifest.xml) nghĩa là nếu app đang mở sẵn
-    // và người dùng cắm iPhone vào (khớp device_filter.xml), Android gửi intent
-    // ACTION_USB_DEVICE_ATTACHED mới vào ĐÂY qua onNewIntent — KHÔNG qua onCreate
-    // lần nữa. Trước đây intent này hoàn toàn không được đọc ở cả hai nơi, nên
-    // việc cắm dây không tự kết nối được gì — người dùng luôn phải tự bấm "Kết
-    // nối" thủ công dù Android đã "biết" có thiết bị mới cắm vào.
+    // launchMode="singleTop" → Android gửi intent USB_DEVICE_ATTACHED mới vào
+    // đây qua onNewIntent khi app đang chạy. Truyền fromAutoAttach=true để
+    // UsbPermissionManager áp dụng cooldown 3 giây, tránh vòng lặp vô tận khi
+    // claimInterface() fail.
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -51,6 +49,10 @@ class MainActivity : ComponentActivity() {
     private fun handleUsbAttachIntent(intent: Intent?) {
         if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
         NativeLog.log("Đã phát hiện iPhone/iPad vừa cắm vào — đang tự động kết nối...")
-        UsbPermissionManager.requestAndOpen(this) { _, msg -> NativeLog.log(msg) }
+        // FIX: fromAutoAttach = true → áp dụng cooldown để phá vòng lặp
+        // claimInterface fail → conn.close() → re-enumerate → ATTACHED → fail → ...
+        UsbPermissionManager.requestAndOpen(this, fromAutoAttach = true) { _, msg ->
+            NativeLog.log(msg)
+        }
     }
 }

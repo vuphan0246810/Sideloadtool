@@ -7,7 +7,18 @@ import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * UsbTransport — Raw USB bulk I/O qua Android USB Host API.
- * THÊM MỚI: @JvmStatic nativeBulkWrite / nativeBulkRead để C JNI gọi được.
+ *
+ * FIX: Thêm delay 150ms + retry 5 lần cho claimInterface().
+ *
+ * Root cause lỗi "claimInterface() thất bại" (lặp vô tận):
+ *   1. Android cần một khoảng thời gian sau openDevice() để giải phóng
+ *      kernel driver và sẵn sàng cho claimInterface(forceClaim=true).
+ *   2. Khi claimInterface fail và ta gọi conn.close(), Android đôi khi
+ *      re-enumerate device → gửi lại USB_DEVICE_ATTACHED → vòng lặp.
+ *   Fix: sleep 150ms trước lần thử đầu + retry tối đa 5 lần với delay tăng
+ *   dần (200ms, 400ms, 600ms, 800ms) trước khi bỏ cuộc.
+ *
+ * @JvmStatic nativeBulkWrite / nativeBulkRead để C JNI gọi được.
  */
 object UsbTransport {
     private const val TAG = "UsbTransport"
@@ -54,28 +65,62 @@ object UsbTransport {
     fun open(device: UsbDevice, usbManager: UsbManager): Boolean {
         close()
         lastError = null
+
         val found = findUsbmuxInterfaceWithConfig(device) ?: run {
             lastError = "Không tìm thấy usbmux interface (class=0xFF sub=0xFE proto=0x02)"
             Log.e(TAG, lastError!!); return false
         }
         val iface = found.iface
-        var ep_in: UsbEndpoint? = null; var ep_out: UsbEndpoint? = null
+
+        var ep_in: UsbEndpoint? = null
+        var ep_out: UsbEndpoint? = null
         for (ei in 0 until iface.endpointCount) {
             val ep = iface.getEndpoint(ei)
             if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
             if (ep.direction == UsbConstants.USB_DIR_IN  && ep_in  == null) ep_in  = ep
             if (ep.direction == UsbConstants.USB_DIR_OUT && ep_out == null) ep_out = ep
         }
-        if (ep_in == null || ep_out == null) { lastError = "Thiếu bulk endpoint"; return false }
+        if (ep_in == null || ep_out == null) {
+            lastError = "Thiếu bulk endpoint"; return false
+        }
+
         val conn = usbManager.openDevice(device) ?: run {
             lastError = "openDevice() trả null — quyền USB chưa được cấp"; return false
         }
-        if (!conn.claimInterface(iface, true)) {
-            conn.close(); lastError = "claimInterface() thất bại"; return false
+
+        // FIX: Đợi OS sẵn sàng trước khi claim (Android USB timing issue).
+        // Nhiều thiết bị iOS cần khoảng delay nhỏ sau openDevice() để kernel
+        // driver hoàn tất quá trình handoff — thiếu delay này claimInterface()
+        // luôn trả false dù forceClaim = true.
+        try { Thread.sleep(150) } catch (_: InterruptedException) {}
+
+        // FIX: Retry tối đa 5 lần với delay tăng dần trước khi bỏ cuộc.
+        // (200ms → 400ms → 600ms → 800ms giữa các lần thử)
+        var claimed = false
+        for (attempt in 1..5) {
+            if (conn.claimInterface(iface, true)) {
+                claimed = true
+                break
+            }
+            if (attempt < 5) {
+                Log.w(TAG, "claimInterface() thất bại lần $attempt/$5, thử lại sau ${attempt * 200}ms...")
+                try { Thread.sleep(attempt * 200L) } catch (_: InterruptedException) {}
+            }
         }
-        connection = conn; usbInterface = iface; endpointIn = ep_in; endpointOut = ep_out
+
+        if (!claimed) {
+            conn.close()
+            lastError = "claimInterface() thất bại sau 5 lần thử — thử rút và cắm lại cáp USB"
+            Log.e(TAG, lastError!!)
+            return false
+        }
+
+        connection = conn
+        usbInterface = iface
+        endpointIn = ep_in
+        endpointOut = ep_out
         _connected.value = true
-        Log.i(TAG, "✅ USB kết nối: ${device.productName}")
+        Log.i(TAG, "✅ USB kết nối thành công: ${device.productName}")
         return true
     }
 

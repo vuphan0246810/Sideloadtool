@@ -9,88 +9,93 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Wraps the standard three-step Android USB permission dance:
  *   1. find the device,
  *   2. ask the user (system dialog) if not already granted,
  *   3. hand the granted device to [UsbTransport.open].
+ *
+ * FIX: Thêm cooldown 3 giây giữa các lần thử kết nối.
+ *
+ * Root cause vòng lặp "claimInterface() thất bại" lặp vô tận:
+ *   Sau khi claimInterface() fail và ta gọi conn.close(), Android có thể
+ *   re-enumerate thiết bị và gửi lại ACTION_USB_DEVICE_ATTACHED. Nếu không
+ *   có cooldown, MainActivity.handleUsbAttachIntent() lại gọi requestAndOpen()
+ *   ngay lập tức → fail → close → ATTACHED lại → vòng lặp vô hạn.
+ *
+ *   Giải pháp: Ghi timestamp lần thử cuối. Nếu lần thử gần nhất < 3 giây
+ *   trước VÀ thất bại, từ chối ngay (không mở dialog quyền, không gọi open).
+ *   Kết quả: vòng lặp tự dừng sau một lần fail, không spam log nữa.
  */
 object UsbPermissionManager {
     private const val ACTION_USB_PERMISSION = "com.superalpha.sideload.USB_PERMISSION"
 
-    // [UsbTransport.open] retries with short sleeps between attempts (see its
-    // kdoc) and must not run on the caller's thread when that thread is the main
-    // thread — the permission BroadcastReceiver below is delivered on the main
-    // thread by default, and requestAndOpen() itself is normally called directly
-    // from a Compose click handler (also main thread). This single-thread
-    // executor keeps all actual open() calls (and their retries) off the UI
-    // thread without pulling in a full coroutine dependency here.
+    // Cooldown giữa các lần thử tự động (ms) — ngăn vòng lặp ATTACHED → fail → ATTACHED
+    private const val AUTO_CONNECT_COOLDOWN_MS = 3_000L
+
+    // Thời điểm lần thử gần nhất (System.currentTimeMillis())
+    private val lastAttemptTime = AtomicLong(0L)
+    // Kết quả lần thử cuối: true = thành công, false = thất bại
+    @Volatile private var lastAttemptSucceeded = false
+
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
-    // Bấm nhiều lần liên tục vào "Kết nối" trước khi lần xin quyền trước hoàn
-    // tất từng tạo ra nhiều BroadcastReceiver ACTION_USB_PERMISSION cùng đăng ký
-    // song song — mỗi cái gọi onResult() riêng, gây ra chuỗi log trùng lặp kiểu
-    // "Mở kết nối USB thất bại" nhiều lần y hệt (đúng như trong video lỗi gốc).
-    // Cờ này chặn việc bắt đầu một yêu cầu quyền mới khi một yêu cầu khác chưa
-    // xử lý xong.
     @Volatile private var requestInFlight = false
     @Volatile private var pendingReceiver: BroadcastReceiver? = null
 
     /**
      * Publishes the connected device's USB serial number (== UDID for essentially every
-     * iPhone/iPad) into [AppConfig.lastUdid], so the rest of the app never has to
-     * round-trip lockdownd/native just to answer "which device is this". Reading
-     * UsbDevice.getSerialNumber() this way (right after our own requestPermission grant)
-     * does not need any extra Android runtime permission beyond the USB device grant
-     * itself, per the platform's USB Host API contract.
+     * iPhone/iPad) into [AppConfig.lastUdid].
      */
     private fun publishUdid(device: UsbDevice) {
-        val serial = try {
-            device.serialNumber
-        } catch (_: Exception) {
-            null
-        }
+        val serial = try { device.serialNumber } catch (_: Exception) { null }
         if (!serial.isNullOrBlank()) {
-            try {
-                AppConfig.lastUdid = serial
-            } catch (_: Exception) {
-                // AppConfig.init() chưa được gọi (không nên xảy ra vì SuperAlphaApp.onCreate()
-                // luôn gọi trước khi bất kỳ luồng USB nào có thể chạy); bỏ qua an toàn.
-            }
+            try { AppConfig.lastUdid = serial } catch (_: Exception) {}
         }
     }
 
-    /** Mô tả lỗi cụ thể từ [UsbTransport.open] gần nhất (chi tiết hơn câu chung
-     * "Mở kết nối USB thất bại."), nếu có. */
     private fun openFailureMessage(): String {
         val detail = UsbTransport.lastError()
-        return if (detail.isNullOrBlank()) {
-            "Mở kết nối USB thất bại."
-        } else {
-            "Mở kết nối USB thất bại: $detail"
-        }
+        return if (detail.isNullOrBlank()) "Mở kết nối USB thất bại."
+        else "Mở kết nối USB thất bại: $detail"
     }
 
     /**
-     * Looks for an attached Apple device and, if found, requests permission (or opens
-     * it immediately if permission is already granted from a previous attach). Calls
-     * [onResult] with true/connected or false/not-found-or-denied — always on the main
-     * thread, so callers (Compose click handlers, NativeLog) don't need to worry about
-     * which thread it runs on. Safe to call multiple times: if a request is already in
-     * flight (e.g. the user tapped "Connect" repeatedly before the first attempt
-     * finished), subsequent calls are ignored instead of stacking up duplicate
-     * permission receivers/open attempts.
+     * Tìm thiết bị Apple, xin quyền (hoặc mở ngay nếu đã có quyền), gọi [onResult].
+     *
+     * @param fromAutoAttach true nếu được gọi từ USB_DEVICE_ATTACHED intent (auto-connect).
+     *   Khi đó áp dụng cooldown 3 giây để tránh vòng lặp.
+     *   false khi người dùng bấm "Kết nối" thủ công — bỏ qua cooldown.
      */
-    fun requestAndOpen(context: Context, onResult: (Boolean, String) -> Unit) {
+    fun requestAndOpen(
+        context: Context,
+        fromAutoAttach: Boolean = false,
+        onResult: (Boolean, String) -> Unit
+    ) {
+        // FIX: Kiểm tra cooldown khi gọi từ auto-attach (không áp dụng khi bấm tay)
+        if (fromAutoAttach) {
+            val now = System.currentTimeMillis()
+            val elapsed = now - lastAttemptTime.get()
+            if (!lastAttemptSucceeded && elapsed < AUTO_CONNECT_COOLDOWN_MS) {
+                // Còn trong cooldown sau lần fail trước — bỏ qua để tránh vòng lặp
+                return
+            }
+        }
+
         if (requestInFlight) {
-            onResult(false, "Đang xử lý yêu cầu kết nối trước đó — vui lòng đợi một chút rồi thử lại.")
+            if (!fromAutoAttach) {
+                onResult(false, "Đang xử lý yêu cầu kết nối trước đó — vui lòng đợi một chút rồi thử lại.")
+            }
             return
         }
         requestInFlight = true
+        lastAttemptTime.set(System.currentTimeMillis())
 
         val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
         fun finish(ok: Boolean, msg: String) {
+            lastAttemptSucceeded = ok
             requestInFlight = false
             mainHandler.post { onResult(ok, msg) }
         }
@@ -111,22 +116,14 @@ object UsbPermissionManager {
             return
         }
 
-        // Nếu có một receiver xin quyền cũ còn treo (vd từ một lần gọi trước bị bỏ
-        // giữa đường), gỡ nó trước khi đăng ký cái mới — tránh hai receiver cùng
-        // xử lý một ACTION_USB_PERMISSION.
+        // Gỡ receiver cũ nếu còn treo
         pendingReceiver?.let {
-            try {
-                context.unregisterReceiver(it)
-            } catch (_: Exception) {
-            }
+            try { context.unregisterReceiver(it) } catch (_: Exception) {}
             pendingReceiver = null
         }
 
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_MUTABLE
-        } else {
-            0
-        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+            PendingIntent.FLAG_MUTABLE else 0
         val permissionIntent = PendingIntent.getBroadcast(
             context, 0, Intent(ACTION_USB_PERMISSION).setPackage(context.packageName), flags
         )
@@ -134,10 +131,7 @@ object UsbPermissionManager {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
                 if (intent.action != ACTION_USB_PERMISSION) return
-                try {
-                    ctx.unregisterReceiver(this)
-                } catch (_: Exception) {
-                }
+                try { ctx.unregisterReceiver(this) } catch (_: Exception) {}
                 pendingReceiver = null
                 val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                 if (!granted) {
