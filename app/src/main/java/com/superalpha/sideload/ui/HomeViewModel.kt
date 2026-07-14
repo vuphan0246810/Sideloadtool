@@ -86,5 +86,41 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ── Tab "Ghép nối" (Pairing) ────────────────────────────────────────────
+    private val _isPaired = MutableStateFlow(false)
+    val isPaired: StateFlow<Boolean> = _isPaired
+
+    /** Kết nối USB (nếu chưa) rồi thực hiện toàn bộ luồng pairing native
+     * (Pair → chờ Trust → StartSession/TLS). Cập nhật [isPaired] khi xong. */
+    fun connectAndPair() {
+        if (_busy.value) return
+        _busy.value = true
+        viewModelScope.launch {
+            val connected = nativeBridge.connect()
+            if (!connected) {
+                NativeLog.emit("[pairing] ❌ Không kết nối được USB — kiểm tra cáp/quyền USB.")
+                _busy.value = false
+                return@launch
+            }
+            nativeBridge.getUdid()?.let { AppConfig.lastUdid = it }
+            val paired = nativeBridge.pair()
+            _isPaired.value = paired
+            if (paired) {
+                NativeLog.emit("[pairing] ✅ Ghép nối với iPhone thành công.")
+            } else {
+                NativeLog.emit("[pairing] ❌ Ghép nối thất bại — kiểm tra log/Trust popup trên iPhone.")
+            }
+            _busy.value = false
+        }
+    }
+
+    /** Xuất pair record hiện tại thành file .plist. Trả kết quả qua callback
+     * vì Compose cần File để mở share sheet ngay khi có, không qua StateFlow. */
+    fun exportPairingFile(onResult: (java.io.File?) -> Unit) {
+        viewModelScope.launch {
+            onResult(nativeBridge.exportPairingFile())
+        }
+    }
+
     override fun onCleared() { super.onCleared(); nativeBridge.reset() }
 }

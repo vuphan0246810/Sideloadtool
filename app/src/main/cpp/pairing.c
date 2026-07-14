@@ -197,22 +197,42 @@ int pairing_do(lockdown_t *ld, pair_record_t *rec_out,
 }
 
 /* ── Lưu/Load pair record ────────────────────────────────────────────────── */
+/*
+ * BUGFIX: bản trước lưu PEM (chứng chỉ/khoá) trực tiếp dưới dạng
+ * "Key=<PEM>\n" — nhưng PEM LUÔN chứa newline bên trong
+ * ("-----BEGIN...-----\nMII...\n-----END...-----\n"), nên fprintf "%s\n" ghi
+ * PEM tràn qua NHIỀU dòng, và read_field() (dừng ở newline ĐẦU TIÊN) chỉ đọc
+ * lại được dòng "-----BEGIN...-----" — dữ liệu bị cắt cụt hoàn toàn. Mọi pair
+ * record lưu ra đều hỏng ngay khi load lại (pairing_load "thành công" nhưng
+ * các trường cert/key rỗng/cụt), khiến ứng dụng phải pair lại từ đầu mỗi lần.
+ *
+ * Fix: base64-encode toàn bộ nội dung PEM (giữ nguyên newline bên trong)
+ * trước khi ghi thành MỘT dòng — dùng b64_encode/b64_decode đã có sẵn trong
+ * plist_util. Round-trip khôi phục lại PEM chính xác từng byte.
+ */
 int pairing_save(const pair_record_t *rec, const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) return -1;
-    fprintf(f, "HostID=%s\n",        rec->host_id        ? rec->host_id        : "");
-    fprintf(f, "SystemBUID=%s\n",    rec->system_buid    ? rec->system_buid    : "");
-    fprintf(f, "RootCert=%s\n",      rec->root_cert_pem  ? rec->root_cert_pem  : "");
-    fprintf(f, "RootKey=%s\n",       rec->root_key_pem   ? rec->root_key_pem   : "");
-    fprintf(f, "HostCert=%s\n",      rec->host_cert_pem  ? rec->host_cert_pem  : "");
-    fprintf(f, "HostKey=%s\n",       rec->host_key_pem   ? rec->host_key_pem   : "");
-    fprintf(f, "DeviceCert=%s\n",    rec->device_cert_pem? rec->device_cert_pem: "");
+
+    fprintf(f, "HostID=%s\n",     rec->host_id     ? rec->host_id     : "");
+    fprintf(f, "SystemBUID=%s\n", rec->system_buid ? rec->system_buid : "");
+
+    const char *pem_keys[] = { "RootCert", "RootKey", "HostCert", "HostKey", "DeviceCert" };
+    const char *pem_vals[] = { rec->root_cert_pem, rec->root_key_pem,
+                               rec->host_cert_pem, rec->host_key_pem,
+                               rec->device_cert_pem };
+    for (int i = 0; i < 5; i++) {
+        const char *v = pem_vals[i] ? pem_vals[i] : "";
+        char *b64 = b64_encode((const unsigned char *)v, strlen(v));
+        fprintf(f, "%s=%s\n", pem_keys[i], b64 ? b64 : "");
+        free(b64);
+    }
     fclose(f);
     LOGI("pairing_save: lưu vào %s", path);
     return 0;
 }
 
-static char *read_field(const char *data, const char *key) {
+static char *read_field_raw(const char *data, const char *key) {
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "%s=", key);
     const char *p = strstr(data, prefix);
@@ -224,6 +244,20 @@ static char *read_field(const char *data, const char *key) {
     memcpy(val, p, end - p);
     val[end - p] = '\0';
     return val;
+}
+
+/* Đọc field base64 (PEM đã encode) và decode lại thành PEM gốc */
+static char *read_field_pem(const char *data, const char *key) {
+    char *b64 = read_field_raw(data, key);
+    if (!b64) return NULL;
+    if (b64[0] == '\0') { return b64; }   /* rỗng — không cần decode */
+    unsigned char *der = NULL;
+    size_t len = b64_decode(b64, &der);
+    free(b64);
+    if (!der) return NULL;
+    /* b64_decode() đã null-terminate tại der[len] */
+    (void)len;
+    return (char *)der;
 }
 
 int pairing_load(pair_record_t *rec, const char *path) {
@@ -238,14 +272,19 @@ int pairing_load(pair_record_t *rec, const char *path) {
     fclose(f);
 
     memset(rec, 0, sizeof(*rec));
-    rec->host_id         = read_field(data, "HostID");
-    rec->system_buid     = read_field(data, "SystemBUID");
-    rec->root_cert_pem   = read_field(data, "RootCert");
-    rec->root_key_pem    = read_field(data, "RootKey");
-    rec->host_cert_pem   = read_field(data, "HostCert");
-    rec->host_key_pem    = read_field(data, "HostKey");
-    rec->device_cert_pem = read_field(data, "DeviceCert");
+    rec->host_id         = read_field_raw(data, "HostID");
+    rec->system_buid     = read_field_raw(data, "SystemBUID");
+    rec->root_cert_pem   = read_field_pem(data, "RootCert");
+    rec->root_key_pem    = read_field_pem(data, "RootKey");
+    rec->host_cert_pem   = read_field_pem(data, "HostCert");
+    rec->host_key_pem    = read_field_pem(data, "HostKey");
+    rec->device_cert_pem = read_field_pem(data, "DeviceCert");
     free(data);
+
+    if (!rec->host_id || !rec->host_cert_pem || !rec->host_cert_pem[0]) {
+        LOGE("pairing_load: pair record thiếu HostID/HostCert — coi như không hợp lệ");
+        return -1;
+    }
     LOGI("pairing_load: đọc từ %s OK", path);
     return 0;
 }

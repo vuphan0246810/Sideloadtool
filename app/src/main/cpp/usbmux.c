@@ -1,16 +1,12 @@
 /*
- * usbmux.c — Triển khai giao thức usbmux Apple.
- * Tham khảo chính: usbmuxd/src/device.c (Martin Szulecki, Nikias Bassen)
- *
- * *** 3 BUG ĐÃ SỬA ***
- *  1. MAGIC 0xFADEDEAD (không phải 0xFEEDFACE)
- *  2. SETUP header: rx_seq=0 trong header, sau đó dev_rx_seq nội bộ = 0xFFFF
- *  3. SYN dùng dev_tx_seq=0, KHÔNG tăng sau SETUP
+ * usbmux.c — Triển khai giao thức usbmux của Apple, khớp byte-for-byte với
+ * usbmuxd/src/device.c (send_packet, device_data_input, device_version_input).
+ * Xem ghi chú đầy đủ trong usbmux.h.
  */
 #include "usbmux.h"
 #include <string.h>
 #include <stdlib.h>
-#include <arpa/inet.h>   /* htonl / htons */
+#include <arpa/inet.h>   /* htonl / htons / ntohl / ntohs */
 #include <android/log.h>
 #include <time.h>
 
@@ -18,17 +14,9 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-/* ── Helpers nội bộ ───────────────────────────────────────────────────────── */
+#define MUX_PKT_MAX (1u << 20)   /* 1MB — giới hạn an toàn cho một gói mux */
 
-static void build_mux_header(mux_header_t *h, mux_conn_t *c,
-                              uint16_t msg, uint32_t payload_len) {
-    h->magic       = htonl(MUX_MAGIC);
-    h->mux_version = htons(0);
-    h->message     = htons(msg);
-    h->tx_seq      = htonl(c->dev_tx_seq);
-    h->rx_seq      = htonl(c->dev_rx_seq);
-    h->length      = htonl(sizeof(mux_header_t) + payload_len);
-}
+/* ── I/O helpers nội bộ ──────────────────────────────────────────────────── */
 
 static int write_all(mux_conn_t *c, const void *buf, int len) {
     const uint8_t *p = buf;
@@ -52,6 +40,112 @@ static int read_all(mux_conn_t *c, void *buf, int len) {
     return got;
 }
 
+/*
+ * mux_header_wire_size — số byte thực sự của mux_header trên dây.
+ * Khớp usbmuxd device.c: int mux_header_size = ((dev->version < 2) ? 8 : sizeof(struct mux_header));
+ */
+static inline int mux_header_wire_size(const mux_conn_t *c) {
+    return (c->version < 2) ? 8 : (int)sizeof(mux_header_t);
+}
+
+/*
+ * send_packet — dựng và gửi một gói mux hoàn chỉnh, khớp send_packet() trong
+ * usbmuxd/src/device.c. `extra_hdr`/`extra_hdr_len` tương ứng "header" param
+ * gốc (version_header cho VERSION, tcp_header_t cho TCP, NULL cho SETUP).
+ */
+static int send_packet(mux_conn_t *c, uint32_t proto,
+                        const void *extra_hdr, int extra_hdr_len,
+                        const void *data, int data_len) {
+    int hdr_size = mux_header_wire_size(c);
+    int total = hdr_size + extra_hdr_len + data_len;
+    if (total <= 0 || (uint32_t)total > MUX_PKT_MAX) {
+        LOGE("send_packet: kích thước gói không hợp lệ %d", total);
+        return -1;
+    }
+
+    uint8_t *buf = calloc(1, total);
+    if (!buf) return -1;
+
+    /* protocol + length luôn được ghi (8 byte đầu, mọi phiên bản) */
+    uint32_t protocol_be = htonl(proto);
+    uint32_t length_be   = htonl((uint32_t)total);
+    memcpy(buf + 0, &protocol_be, 4);
+    memcpy(buf + 4, &length_be,   4);
+
+    if (c->version >= 2) {
+        uint32_t magic_be = htonl(MUX_MAGIC);
+        memcpy(buf + 8, &magic_be, 4);
+
+        if (proto == MUX_PROTO_SETUP) {
+            /* Khớp device.c: SETUP luôn reset tx_seq=0, rx_seq=0xFFFF */
+            c->dev_tx_seq = 0;
+            c->dev_rx_seq = 0xFFFF;
+        }
+        uint16_t tx_be = htons(c->dev_tx_seq);
+        uint16_t rx_be = htons(c->dev_rx_seq);
+        memcpy(buf + 12, &tx_be, 2);
+        memcpy(buf + 14, &rx_be, 2);
+        c->dev_tx_seq++;   /* tăng sau MỌI gói gửi khi version >= 2 */
+    }
+
+    if (extra_hdr && extra_hdr_len > 0)
+        memcpy(buf + hdr_size, extra_hdr, extra_hdr_len);
+    if (data && data_len > 0)
+        memcpy(buf + hdr_size + extra_hdr_len, data, data_len);
+
+    int r = write_all(c, buf, total);
+    free(buf);
+    if (r < 0) { LOGE("send_packet: gửi thất bại (proto=%u total=%d)", proto, total); return -1; }
+    return total;
+}
+
+/*
+ * recv_packet — đọc một gói mux hoàn chỉnh (8 byte đầu để biết length, rồi
+ * đọc phần còn lại). Khớp cách device_data_input() diễn giải buffer.
+ * Trả về buffer malloc() (caller free), *out_len = tổng bytes, *out_proto =
+ * giá trị protocol (host order). *out_body = con trỏ ngay sau mux header
+ * (hdr_size bytes đầu), *out_body_len = phần còn lại.
+ */
+static uint8_t *recv_packet(mux_conn_t *c, uint32_t *out_proto,
+                             uint8_t **out_body, uint32_t *out_body_len) {
+    uint8_t head[8];
+    if (read_all(c, head, 8) < 0) return NULL;
+
+    uint32_t proto, total;
+    memcpy(&proto, head + 0, 4);
+    memcpy(&total, head + 4, 4);
+    proto = ntohl(proto);
+    total = ntohl(total);
+
+    if (total < 8 || total > MUX_PKT_MAX) {
+        LOGE("recv_packet: length không hợp lệ %u", total);
+        return NULL;
+    }
+
+    uint8_t *buf = malloc(total);
+    if (!buf) return NULL;
+    memcpy(buf, head, 8);
+    if (total > 8) {
+        if (read_all(c, buf + 8, (int)(total - 8)) < 0) { free(buf); return NULL; }
+    }
+
+    int hdr_size = mux_header_wire_size(c);
+    if ((uint32_t)hdr_size > total) { free(buf); return NULL; }
+
+    /* Khớp device.c: dev->rx_seq = ntohs(mhdr->rx_seq) khi version >= 2,
+     * áp dụng cho MỌI gói nhận được (đọc TRƯỚC KHI cập nhật version). */
+    if (c->version >= 2 && total >= sizeof(mux_header_t)) {
+        uint16_t rx_be;
+        memcpy(&rx_be, buf + 14, 2);
+        c->dev_rx_seq = ntohs(rx_be);
+    }
+
+    if (out_proto) *out_proto = proto;
+    if (out_body)  *out_body  = buf + hdr_size;
+    if (out_body_len) *out_body_len = total - (uint32_t)hdr_size;
+    return buf;
+}
+
 /* ── API Public ───────────────────────────────────────────────────────────── */
 
 int mux_conn_init(mux_conn_t *c,
@@ -60,230 +154,218 @@ int mux_conn_init(mux_conn_t *c,
     memset(c, 0, sizeof(*c));
     c->usb_write   = usb_write;
     c->usb_read    = usb_read;
+    c->version     = 0;      /* chưa thỏa thuận phiên bản */
     c->dev_tx_seq  = 0;
-    c->dev_rx_seq  = 0;      /* sẽ được set thành 0xFFFF SAU khi gửi SETUP */
+    c->dev_rx_seq  = 0;
     c->state       = MUX_CONN_CLOSED;
-    /* source port ngẫu nhiên */
-    srand((unsigned)time(NULL));
+    /* source port ngẫu nhiên cho virtual TCP-over-mux */
+    srand((unsigned)time(NULL) ^ (unsigned)(intptr_t)c);
     c->sport = 50000 + (rand() % 10000);
     return 0;
 }
 
 /*
- * mux_do_setup — Gửi SETUP packet để thỏa thuận phiên bản usbmux 2.0.
- *
- * Theo usbmuxd/src/device.c device_version_input():
- *   mhdr->rx_seq = 0  ← trong header (KHÔNG phải 0xFFFF)
- *   dev->rx_seq = 0xFFFF  ← được set SAU KHI gửi xong
- *   dev->tx_seq KHÔNG thay đổi sau SETUP (vẫn là 0 cho SYN tiếp theo)
+ * mux_do_setup — Bắt tay usbmux đầy đủ, khớp device_add() + device_version_input()
+ * trong usbmuxd/src/device.c:
+ *   1. Gửi MUX_PROTO_VERSION (header 8 byte vì version=0) với payload
+ *      version_header{major=2, minor=0, padding=0}.
+ *   2. Nhận phản hồi VERSION từ thiết bị (cũng dùng header 8 byte, vì phía
+ *      ta vẫn coi version=0 tại thời điểm nhận gói ĐẦU TIÊN này).
+ *   3. Đặt c->version = major thiết bị trả về (1 hoặc 2).
+ *   4. Nếu version >= 2: gửi MUX_PROTO_SETUP (header 16 byte, payload 1 byte
+ *      0x07) — bên trong tự reset dev_tx_seq=0/dev_rx_seq=0xFFFF.
  */
 int mux_do_setup(mux_conn_t *c) {
-    /* Payload: 8 bytes version request */
-    uint8_t payload[8];
-    uint32_t *p = (uint32_t *)payload;
-    p[0] = htonl(MUX_VERSION_MAJOR);   /* version major */
-    p[1] = htonl(MUX_VERSION_MINOR);   /* version minor */
+    mux_version_header_t vh;
+    vh.major   = htonl(MUX_VERSION_MAJOR);
+    vh.minor   = htonl(MUX_VERSION_MINOR);
+    vh.padding = 0;
 
-    /* Build header — dev_rx_seq PHẢI là 0 tại thời điểm này */
-    uint8_t pkt[sizeof(mux_header_t) + sizeof(payload)];
-    mux_header_t *h = (mux_header_t *)pkt;
-    build_mux_header(h, c, MUX_MSG_SETUP, sizeof(payload));
-    /* KIỂM TRA: rx_seq trong header phải là 0 (htonl(0)) */
-    LOGI("[mux] SETUP: tx_seq=%u rx_seq=%u magic=0x%08X",
-         c->dev_tx_seq, c->dev_rx_seq, MUX_MAGIC);
-
-    memcpy(pkt + sizeof(mux_header_t), payload, sizeof(payload));
-
-    if (write_all(c, pkt, sizeof(pkt)) < 0) {
-        LOGE("SETUP write failed");
+    LOGI("[mux] Gửi VERSION packet (major=%d minor=%d)...", MUX_VERSION_MAJOR, MUX_VERSION_MINOR);
+    if (send_packet(c, MUX_PROTO_VERSION, &vh, sizeof(vh), NULL, 0) < 0) {
+        LOGE("[mux] ❌ Gửi VERSION packet thất bại");
         return -1;
     }
 
-    /* SAU KHI GỬI: set dev_rx_seq = 0xFFFF (như usbmuxd device.c) */
-    c->dev_rx_seq = 0xFFFF;
-    /* dev_tx_seq GIỮ NGUYÊN = 0 (không tăng sau SETUP) */
+    uint32_t proto = 0, body_len = 0;
+    uint8_t *body = NULL;
+    uint8_t *pkt = recv_packet(c, &proto, &body, &body_len);
+    if (!pkt) {
+        LOGE("[mux] ❌ Không nhận được phản hồi VERSION từ thiết bị");
+        return -1;
+    }
+    if (proto != MUX_PROTO_VERSION || body_len < sizeof(mux_version_header_t)) {
+        LOGE("[mux] ❌ Phản hồi VERSION không hợp lệ (proto=%u body_len=%u)", proto, body_len);
+        free(pkt);
+        return -1;
+    }
+    mux_version_header_t rvh;
+    memcpy(&rvh, body, sizeof(rvh));
+    free(pkt);
 
-    /* Đọc response của thiết bị */
-    uint8_t resp[sizeof(mux_header_t) + 8];
-    if (read_all(c, resp, sizeof(resp)) < 0) {
-        LOGE("SETUP read response failed");
+    uint32_t dev_major = ntohl(rvh.major);
+    uint32_t dev_minor = ntohl(rvh.minor);
+    if (dev_major != 1 && dev_major != 2) {
+        LOGE("[mux] ❌ Thiết bị trả về version không hỗ trợ: %u.%u", dev_major, dev_minor);
         return -1;
     }
-    mux_header_t *rh = (mux_header_t *)resp;
-    uint32_t magic = ntohl(rh->magic);
-    if (magic != MUX_MAGIC) {
-        LOGE("SETUP response magic sai: 0x%08X (expected 0x%08X)", magic, MUX_MAGIC);
-        return -1;
+    c->version = (int)dev_major;
+    LOGI("[mux] ✅ Thiết bị chấp nhận usbmux v%u.%u", dev_major, dev_minor);
+
+    if (c->version >= 2) {
+        LOGI("[mux] Gửi SETUP packet (protocol=2)...");
+        const uint8_t setup_payload = 0x07;
+        if (send_packet(c, MUX_PROTO_SETUP, NULL, 0, &setup_payload, 1) < 0) {
+            LOGE("[mux] ❌ Gửi SETUP packet thất bại");
+            return -1;
+        }
+        LOGI("[mux] ✅ SETUP hoàn tất (dev_tx_seq=%u dev_rx_seq=%u)", c->dev_tx_seq, c->dev_rx_seq);
     }
-    uint32_t *rv = (uint32_t *)(resp + sizeof(mux_header_t));
-    uint32_t major = ntohl(rv[0]), minor = ntohl(rv[1]);
-    LOGI("[mux] Thiết bị chấp nhận phiên bản usbmux %u.%u ✅", major, minor);
     return 0;
 }
 
 /*
- * mux_connect — Thực hiện TCP-over-USB handshake để kết nối đến dport.
- * Gửi SYN, nhận SYN+ACK, gửi ACK.
- * SYN dùng dev_tx_seq = 0 (= 0 vì chưa bị tăng sau SETUP).
+ * mux_connect — Thực hiện TCP-over-USB handshake (SYN → SYN/ACK → ACK) đến
+ * dport, đóng gói qua MUX_PROTO_TCP (encapsulated trong mux header đã thỏa
+ * thuận version ở mux_do_setup).
  */
 int mux_connect(mux_conn_t *c, int dport) {
+    if (c->version < 1) {
+        LOGE("[mux] mux_connect: chưa gọi mux_do_setup() thành công");
+        return -1;
+    }
     c->dport = dport;
     c->tx_seq = 0;
     c->rx_seq = 0;
 
     /* ── Gửi SYN ─────────────────────────────────────────────────────── */
-    uint8_t syn_pkt[sizeof(mux_header_t) + sizeof(tcp_header_t)];
-    memset(syn_pkt, 0, sizeof(syn_pkt));
+    tcp_header_t th;
+    memset(&th, 0, sizeof(th));
+    th.sport    = htons((uint16_t)c->sport);
+    th.dport    = htons((uint16_t)dport);
+    th.seq      = htonl(c->tx_seq);
+    th.ack      = htonl(0);
+    th.offset   = 0x50;    /* data offset: 5 * 4 = 20 bytes, no options */
+    th.flags    = TCP_SYN;
+    th.wnd      = htons(0xFFFF);
+    th.checksum = 0;
+    th.urg      = 0;
 
-    mux_header_t *mh = (mux_header_t *)syn_pkt;
-    build_mux_header(mh, c, MUX_MSG_TCP, sizeof(tcp_header_t));
-
-    tcp_header_t *th = (tcp_header_t *)(syn_pkt + sizeof(mux_header_t));
-    th->sport    = htons(c->sport);
-    th->dport    = htons(dport);
-    th->seq      = htonl(c->tx_seq);
-    th->ack      = htonl(0);
-    th->offset   = 0x50;    /* data offset: 5 * 4 = 20 bytes, no options */
-    th->flags    = TCP_SYN;
-    th->wnd      = htons(0xFFFF);
-    th->checksum = 0;
-    th->urg      = 0;
-
-    LOGI("[mux] SYN → port %d  dev_tx_seq=%u dev_rx_seq=%u",
-         dport, c->dev_tx_seq, c->dev_rx_seq);
-
-    if (write_all(c, syn_pkt, sizeof(syn_pkt)) < 0) {
-        LOGE("SYN write failed"); return -1;
-    }
-    c->dev_tx_seq++;   /* SYN được tính, tăng cho lần sau */
-
-    /* ── Đọc SYN+ACK ─────────────────────────────────────────────────── */
-    uint8_t resp[sizeof(mux_header_t) + sizeof(tcp_header_t)];
-    if (read_all(c, resp, sizeof(resp)) < 0) {
-        LOGE("SYN+ACK read failed"); return -1;
-    }
-    mux_header_t *rm = (mux_header_t *)resp;
-    c->dev_rx_seq = ntohl(rm->tx_seq);
-
-    tcp_header_t *rt = (tcp_header_t *)(resp + sizeof(mux_header_t));
-    if (!(rt->flags & TCP_SYN) || !(rt->flags & TCP_ACK)) {
-        LOGE("Unexpected flags 0x%02X (expected SYN+ACK=0x12)", rt->flags);
+    LOGI("[mux] SYN → port %d", dport);
+    if (send_packet(c, MUX_PROTO_TCP, &th, sizeof(th), NULL, 0) < 0) {
+        LOGE("[mux] ❌ Gửi SYN thất bại");
         return -1;
     }
-    c->rx_seq  = ntohl(rt->seq) + 1;   /* ack = remote seq + 1 */
-    c->tx_seq  = ntohl(rt->ack);
-    c->rx_window = ntohs(rt->wnd);
-    LOGI("[mux] SYN+ACK nhận ✅ rx_seq=%u tx_seq=%u wnd=%u",
-         c->rx_seq, c->tx_seq, c->rx_window);
+
+    /* ── Nhận SYN+ACK ────────────────────────────────────────────────── */
+    uint32_t proto = 0, body_len = 0;
+    uint8_t *body = NULL;
+    uint8_t *pkt = recv_packet(c, &proto, &body, &body_len);
+    if (!pkt) { LOGE("[mux] ❌ Không nhận được SYN+ACK"); return -1; }
+    if (proto != MUX_PROTO_TCP || body_len < sizeof(tcp_header_t)) {
+        LOGE("[mux] ❌ Phản hồi SYN không hợp lệ (proto=%u body_len=%u)", proto, body_len);
+        free(pkt);
+        return -1;
+    }
+    tcp_header_t rt;
+    memcpy(&rt, body, sizeof(rt));
+    free(pkt);
+
+    if (!(rt.flags & TCP_SYN) || !(rt.flags & TCP_ACK)) {
+        LOGE("[mux] ❌ Cờ TCP không đúng 0x%02X (cần SYN+ACK=0x12)", rt.flags);
+        return -1;
+    }
+    c->rx_seq    = ntohl(rt.seq) + 1;   /* ack = remote seq + 1 */
+    c->tx_seq    = ntohl(rt.ack);
+    c->rx_window = ntohs(rt.wnd);
+    LOGI("[mux] ✅ SYN+ACK nhận: rx_seq=%u tx_seq=%u wnd=%u", c->rx_seq, c->tx_seq, c->rx_window);
 
     /* ── Gửi ACK ─────────────────────────────────────────────────────── */
-    uint8_t ack_pkt[sizeof(mux_header_t) + sizeof(tcp_header_t)];
-    memset(ack_pkt, 0, sizeof(ack_pkt));
+    memset(&th, 0, sizeof(th));
+    th.sport  = htons((uint16_t)c->sport);
+    th.dport  = htons((uint16_t)dport);
+    th.seq    = htonl(c->tx_seq);
+    th.ack    = htonl(c->rx_seq);
+    th.offset = 0x50;
+    th.flags  = TCP_ACK;
+    th.wnd    = htons(0xFFFF);
 
-    mux_header_t *am = (mux_header_t *)ack_pkt;
-    build_mux_header(am, c, MUX_MSG_TCP, sizeof(tcp_header_t));
-
-    tcp_header_t *at = (tcp_header_t *)(ack_pkt + sizeof(mux_header_t));
-    at->sport    = htons(c->sport);
-    at->dport    = htons(dport);
-    at->seq      = htonl(c->tx_seq);
-    at->ack      = htonl(c->rx_seq);
-    at->offset   = 0x50;
-    at->flags    = TCP_ACK;
-    at->wnd      = htons(0xFFFF);
-
-    if (write_all(c, ack_pkt, sizeof(ack_pkt)) < 0) {
-        LOGE("ACK write failed"); return -1;
+    if (send_packet(c, MUX_PROTO_TCP, &th, sizeof(th), NULL, 0) < 0) {
+        LOGE("[mux] ❌ Gửi ACK thất bại");
+        return -1;
     }
-    c->dev_tx_seq++;
     c->state = MUX_CONN_CONNECTED;
-    LOGI("[mux] Kết nối TCP-over-USB thành công đến port %d ✅", dport);
+    LOGI("[mux] ✅ Kết nối TCP-over-USB thành công đến port %d", dport);
     return 0;
 }
 
-/* Gửi data (DATA + PSH + ACK) */
+/* Gửi data (ACK + PSH) */
 int mux_send(mux_conn_t *c, const void *data, int len) {
     if (c->state != MUX_CONN_CONNECTED) return -1;
-    int total = sizeof(mux_header_t) + sizeof(tcp_header_t) + len;
-    uint8_t *pkt = malloc(total);
-    if (!pkt) return -1;
-    memset(pkt, 0, total);
 
-    mux_header_t *mh = (mux_header_t *)pkt;
-    build_mux_header(mh, c, MUX_MSG_TCP, sizeof(tcp_header_t) + len);
+    tcp_header_t th;
+    memset(&th, 0, sizeof(th));
+    th.sport  = htons((uint16_t)c->sport);
+    th.dport  = htons((uint16_t)c->dport);
+    th.seq    = htonl(c->tx_seq);
+    th.ack    = htonl(c->rx_seq);
+    th.offset = 0x50;
+    th.flags  = TCP_ACK | TCP_PSH;
+    th.wnd    = htons(0xFFFF);
 
-    tcp_header_t *th = (tcp_header_t *)(pkt + sizeof(mux_header_t));
-    th->sport    = htons(c->sport);
-    th->dport    = htons(c->dport);
-    th->seq      = htonl(c->tx_seq);
-    th->ack      = htonl(c->rx_seq);
-    th->offset   = 0x50;
-    th->flags    = TCP_ACK | 0x008; /* ACK + PSH */
-    th->wnd      = htons(0xFFFF);
-    memcpy(pkt + sizeof(mux_header_t) + sizeof(tcp_header_t), data, len);
-
-    int r = write_all(c, pkt, total);
-    free(pkt);
+    int r = send_packet(c, MUX_PROTO_TCP, &th, sizeof(th), data, len);
     if (r < 0) { LOGE("mux_send failed"); return -1; }
 
-    c->tx_seq    += len;
-    c->dev_tx_seq++;
+    c->tx_seq += (uint32_t)len;
     return len;
 }
 
 /* Nhận data — trả về số bytes thực tế */
 int mux_recv(mux_conn_t *c, void *buf, int maxlen) {
     if (c->state != MUX_CONN_CONNECTED) return -1;
-    uint8_t hdr_buf[sizeof(mux_header_t) + sizeof(tcp_header_t)];
-    if (read_all(c, hdr_buf, sizeof(hdr_buf)) < 0) return -1;
 
-    mux_header_t *mh = (mux_header_t *)hdr_buf;
-    c->dev_rx_seq = ntohl(mh->tx_seq);
-    uint32_t total = ntohl(mh->length);
-    uint32_t full_payload = total - sizeof(mux_header_t) - sizeof(tcp_header_t);
-    if (full_payload == 0) return 0;
+    uint32_t proto = 0, body_len = 0;
+    uint8_t *body = NULL;
+    uint8_t *pkt = recv_packet(c, &proto, &body, &body_len);
+    if (!pkt) return -1;
 
-    /* BUGFIX v11: Tính read_len riêng, sau đó drain phần dư thay vì bỏ qua.
-     * Nếu không drain, bytes thừa sẽ nằm lại trong USB buffer và làm hỏng
-     * header của packet tiếp theo → toàn bộ mux bị desync sau lần đầu tiên
-     * caller truyền maxlen nhỏ hơn payload thực tế. */
-    uint32_t read_len = ((uint32_t)maxlen < full_payload) ? (uint32_t)maxlen : full_payload;
-
-    tcp_header_t *th = (tcp_header_t *)(hdr_buf + sizeof(mux_header_t));
-    c->rx_window = ntohs(th->wnd);
-
-    int got = read_all(c, buf, (int)read_len);
-    if (got < 0) return -1;
-    c->rx_seq += got;
-
-    /* Drain any remaining bytes that didn't fit in the caller's buffer */
-    uint32_t excess = full_payload - read_len;
-    if (excess > 0) {
-        char drain_buf[512];
-        uint32_t drained = 0;
-        while (drained < excess) {
-            int chunk = (int)((excess - drained) < sizeof(drain_buf)
-                              ? (excess - drained) : sizeof(drain_buf));
-            if (read_all(c, drain_buf, chunk) < 0) break;
-            drained += (uint32_t)chunk;
-        }
+    if (proto != MUX_PROTO_TCP || body_len < sizeof(tcp_header_t)) {
+        LOGE("mux_recv: gói không hợp lệ (proto=%u body_len=%u)", proto, body_len);
+        free(pkt);
+        return -1;
     }
+    tcp_header_t th;
+    memcpy(&th, body, sizeof(th));
+    c->rx_window = ntohs(th.wnd);
+
+    uint32_t payload_len = body_len - sizeof(tcp_header_t);
+    const uint8_t *payload = body + sizeof(tcp_header_t);
+
+    int got = 0;
+    if (payload_len > 0) {
+        uint32_t copy_len = ((uint32_t)maxlen < payload_len) ? (uint32_t)maxlen : payload_len;
+        memcpy(buf, payload, copy_len);
+        got = (int)copy_len;
+        c->rx_seq += copy_len;
+        /* Nếu caller truyền buffer nhỏ hơn payload thực tế, phần dư đã nằm
+         * trong `pkt` (đã đọc đủ nguyên gói ở recv_packet) nên KHÔNG bị mất
+         * đồng bộ — khác với bản cũ phải "drain" thủ công vì đọc theo kiểu
+         * dò kích thước cố định. */
+    }
+    free(pkt);
 
     /* Gửi ACK ngay */
-    uint8_t ack_pkt[sizeof(mux_header_t) + sizeof(tcp_header_t)];
-    memset(ack_pkt, 0, sizeof(ack_pkt));
-    mux_header_t *am = (mux_header_t *)ack_pkt;
-    build_mux_header(am, c, MUX_MSG_TCP, sizeof(tcp_header_t));
-    tcp_header_t *at = (tcp_header_t *)(ack_pkt + sizeof(mux_header_t));
-    at->sport  = htons(c->sport);
-    at->dport  = htons(c->dport);
-    at->seq    = htonl(c->tx_seq);
-    at->ack    = htonl(c->rx_seq);
-    at->offset = 0x50;
-    at->flags  = TCP_ACK;
-    at->wnd    = htons(0xFFFF);
-    write_all(c, ack_pkt, sizeof(ack_pkt));
-    c->dev_tx_seq++;
+    tcp_header_t at;
+    memset(&at, 0, sizeof(at));
+    at.sport  = htons((uint16_t)c->sport);
+    at.dport  = htons((uint16_t)c->dport);
+    at.seq    = htonl(c->tx_seq);
+    at.ack    = htonl(c->rx_seq);
+    at.offset = 0x50;
+    at.flags  = TCP_ACK;
+    at.wnd    = htons(0xFFFF);
+    send_packet(c, MUX_PROTO_TCP, &at, sizeof(at), NULL, 0);
+
     return got;
 }
 
@@ -301,20 +383,16 @@ int mux_recv_exact(mux_conn_t *c, void *buf, int len) {
 
 void mux_disconnect(mux_conn_t *c) {
     if (c->state != MUX_CONN_CONNECTED) return;
-    /* Gửi FIN+ACK */
-    uint8_t fin_pkt[sizeof(mux_header_t) + sizeof(tcp_header_t)];
-    memset(fin_pkt, 0, sizeof(fin_pkt));
-    mux_header_t *mh = (mux_header_t *)fin_pkt;
-    build_mux_header(mh, c, MUX_MSG_TCP, sizeof(tcp_header_t));
-    tcp_header_t *th = (tcp_header_t *)(fin_pkt + sizeof(mux_header_t));
-    th->sport  = htons(c->sport);
-    th->dport  = htons(c->dport);
-    th->seq    = htonl(c->tx_seq);
-    th->ack    = htonl(c->rx_seq);
-    th->offset = 0x50;
-    th->flags  = TCP_FIN | TCP_ACK;
-    th->wnd    = htons(0xFFFF);
-    write_all(c, fin_pkt, sizeof(fin_pkt));
+    tcp_header_t th;
+    memset(&th, 0, sizeof(th));
+    th.sport  = htons((uint16_t)c->sport);
+    th.dport  = htons((uint16_t)c->dport);
+    th.seq    = htonl(c->tx_seq);
+    th.ack    = htonl(c->rx_seq);
+    th.offset = 0x50;
+    th.flags  = TCP_FIN | TCP_ACK;
+    th.wnd    = htons(0xFFFF);
+    send_packet(c, MUX_PROTO_TCP, &th, sizeof(th), NULL, 0);
     c->state = MUX_CONN_CLOSED;
     LOGI("[mux] Đã đóng kết nối TCP-over-USB.");
 }

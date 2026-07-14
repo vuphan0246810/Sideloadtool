@@ -581,13 +581,25 @@ def do_sideload(
             return False
 
         # ── Cài đặt lên thiết bị qua USB ─────────────────────────────────────
+        # BUGFIX (video crash log): device_link không có hàm connect_and_pair() —
+        # hàm đúng là pair_device()/pair_with_device(), trả về một pair_record
+        # (dict) thay vì bool, và raise LockdownError khi thất bại. Đồng thời
+        # install_ipa(pair_record, remote_ipa_path) cần 2 tham số, không phải 1 —
+        # phải gọi afc_push_ipa() trước để "stage" đường dẫn IPA local.
         print("Đang kết nối với thiết bị iOS qua USB...")
-        if not device_link.connect_and_pair():
-            print("❌ Không kết nối được với thiết bị iOS — kiểm tra cáp và bấm Trust nếu iPhone hỏi.")
+        try:
+            pair_record = device_link.pair_device()
+        except device_link.LockdownError as e:
+            print(f"❌ Không kết nối được với thiết bị iOS: {e}")
             return False
+
         print("Đang cài đặt IPA lên thiết bị...")
-        if not device_link.install_ipa(signed_ipa):
-            print("❌ Cài đặt thất bại — kiểm tra log.")
+        try:
+            remote_ipa_path = device_link.afc_push_ipa(
+                pair_record, signed_ipa, os.path.basename(signed_ipa))
+            device_link.install_ipa(pair_record, remote_ipa_path)
+        except device_link.LockdownError as e:
+            print(f"❌ Cài đặt thất bại: {e}")
             return False
 
         print("✅ Cài đặt ứng dụng thành công!")

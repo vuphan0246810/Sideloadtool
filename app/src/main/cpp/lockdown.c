@@ -3,10 +3,18 @@
  * Tham chiếu: libimobiledevice/src/lockdown.c
  */
 #include "lockdown.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <android/log.h>
+
+#ifndef _GNU_SOURCE
+/* asprintf() là phần mở rộng GNU/BSD, không nằm trong ISO C — bionic (NDK)
+ * expose nó không cần _GNU_SOURCE, nhưng khai báo tường minh ở đây để tránh
+ * "implicit declaration" trên các toolchain glibc nghiêm ngặt hơn. */
+extern int asprintf(char **strp, const char *fmt, ...);
+#endif
 
 #define TAG "lockdown"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)

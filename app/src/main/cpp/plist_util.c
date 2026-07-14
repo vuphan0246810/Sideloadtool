@@ -4,6 +4,7 @@
  */
 #include "plist_util.h"
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -190,6 +191,45 @@ char *plist_build_install_poll(void) {
     char *result = NULL;
     asprintf(&result, "%s<key>Command</key><string>Lookup</string>%s",
              PLIST_HEADER, PLIST_FOOTER);
+    return result;
+}
+
+char *plist_build_pairing_export(const char *udid,
+                                  const char *host_id,
+                                  const char *system_buid,
+                                  const char *root_cert_pem,
+                                  const char *root_key_pem,
+                                  const char *host_cert_pem,
+                                  const char *host_key_pem,
+                                  const char *device_cert_pem) {
+    char *root_cert_b64   = pem_to_b64(root_cert_pem);
+    char *root_key_b64    = pem_to_b64(root_key_pem);
+    char *host_cert_b64   = pem_to_b64(host_cert_pem);
+    char *host_key_b64    = pem_to_b64(host_key_pem);
+    char *device_cert_b64 = pem_to_b64(device_cert_pem);
+
+    char *result = NULL;
+    asprintf(&result,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
+        " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\"><dict>"
+          "<key>UDID</key><string>%s</string>"
+          "<key>HostID</key><string>%s</string>"
+          "<key>SystemBUID</key><string>%s</string>"
+          "<key>RootCertificate</key><data>%s</data>"
+          "<key>RootPrivateKey</key><data>%s</data>"
+          "<key>HostCertificate</key><data>%s</data>"
+          "<key>HostPrivateKey</key><data>%s</data>"
+          "<key>DeviceCertificate</key><data>%s</data>"
+        "</dict></plist>",
+        udid ? udid : "",
+        host_id ? host_id : "",
+        system_buid ? system_buid : "",
+        root_cert_b64, root_key_b64, host_cert_b64, host_key_b64, device_cert_b64);
+
+    free(root_cert_b64); free(root_key_b64);
+    free(host_cert_b64); free(host_key_b64); free(device_cert_b64);
     return result;
 }
 

@@ -25,6 +25,7 @@
 #include "afc.h"
 #include "install_proxy.h"
 #include <jni.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <android/log.h>
@@ -340,6 +341,36 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetUdid(
         JNIEnv *env, jobject thiz) {
     if (g_udid[0]) return (*env)->NewStringUTF(env, g_udid);
     return NULL;
+}
+
+/* ── Tab "Ghép nối" (Pairing): kiểm tra trạng thái + xuất file pairing ────── */
+JNIEXPORT jboolean JNICALL
+Java_com_superalpha_sideload_bridge_NativeBridge_nativeIsPaired(
+        JNIEnv *env, jobject thiz) {
+    (void)env; (void)thiz;
+    return (g_rec.host_id && g_rec.host_id[0] &&
+            g_rec.host_cert_pem && g_rec.host_cert_pem[0]) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingPlist(
+        JNIEnv *env, jobject thiz) {
+    (void)thiz;
+    if (!g_rec.host_id || !g_rec.host_id[0]) {
+        jni_log(env, "[pairing] Chưa có pair record để xuất — hãy ghép nối trước.");
+        return NULL;
+    }
+    char *xml = plist_build_pairing_export(
+        g_udid[0] ? g_udid : "unknown",
+        g_rec.host_id,
+        g_rec.system_buid ? g_rec.system_buid : "00000000-0000-0000-0000-000000000000",
+        g_rec.root_cert_pem, g_rec.root_key_pem,
+        g_rec.host_cert_pem, g_rec.host_key_pem,
+        g_rec.device_cert_pem);
+    if (!xml) return NULL;
+    jstring result = (*env)->NewStringUTF(env, xml);
+    free(xml);
+    return result;
 }
 
 JNIEXPORT void JNICALL

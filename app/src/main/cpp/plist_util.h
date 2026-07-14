@@ -41,6 +41,19 @@ char *plist_build_start_session(const char *system_buid, const char *host_id);
 char *plist_build_install_request(const char *pkg_path);
 char *plist_build_install_poll(void);
 
+/* Xuất pair record hiện tại thành plist chuẩn kiểu Apple (idevicepair-style),
+ * dùng cho tab "Ghép nối" — người dùng có thể lưu/chia sẻ file .plist này.
+ * Certs/keys được strip PEM armor rồi nhúng dưới dạng <data> base64, giống
+ * định dạng pairing record thật của libimobiledevice/usbmuxd. */
+char *plist_build_pairing_export(const char *udid,
+                                  const char *host_id,
+                                  const char *system_buid,
+                                  const char *root_cert_pem,
+                                  const char *root_key_pem,
+                                  const char *host_cert_pem,
+                                  const char *host_key_pem,
+                                  const char *device_cert_pem);
+
 /* ── Parser ─────────────────────────────────────────────────────────────── */
 plist_dict_t *plist_parse(const char *xml);
 const char   *plist_get_str (plist_dict_t *d, const char *key);

@@ -114,6 +114,40 @@ class NativeBridge(private val context: Context) {
         }
     }
 
+    /** true nếu đã có pair record hợp lệ trong bộ nhớ native (đã pair thành
+     * công trong session hiện tại — dùng cho tab "Ghép nối" để bật nút xuất
+     * file, không cần kết nối USB vẫn đang mở). */
+    fun isPaired(): Boolean = try {
+        nativeIsPaired()
+    } catch (e: Exception) {
+        Log.e(TAG, "isPaired() exception: ${e.message}", e)
+        false
+    }
+
+    /**
+     * Xuất pair record hiện tại thành file .plist chuẩn (kiểu idevicepair)
+     * dưới app-private storage rồi trả về File đã ghi, để UI chia sẻ/lưu qua
+     * FileProvider. Trả về null nếu chưa pairing hoặc build plist lỗi.
+     */
+    suspend fun exportPairingFile(): java.io.File? = withContext(Dispatchers.IO) {
+        try {
+            val xml = nativeGetPairingPlist() ?: run {
+                NativeLog.emit("[bridge] ❌ Chưa có pair record để xuất — hãy ghép nối trước.")
+                return@withContext null
+            }
+            val udid = nativeGetUdid() ?: "unknown"
+            val dir = java.io.File(context.filesDir, "exported_pairing").apply { mkdirs() }
+            val file = java.io.File(dir, "pairing_$udid.plist")
+            file.writeText(xml, Charsets.UTF_8)
+            NativeLog.emit("[bridge] ✅ Đã xuất pairing file: ${file.absolutePath}")
+            file
+        } catch (e: Exception) {
+            Log.e(TAG, "exportPairingFile() exception: ${e.message}", e)
+            NativeLog.emit("[bridge] ❌ Xuất pairing file thất bại: ${e.message}")
+            null
+        }
+    }
+
     /* ── JNI native declarations (implemented trong jni_bridge.c) ────────── */
     private external fun nativeInit(filesDir: String)
     private external fun nativeConnect(): Boolean
@@ -121,4 +155,6 @@ class NativeBridge(private val context: Context) {
     private external fun nativeSideload(ipaPath: String): Boolean
     private external fun nativeGetUdid(): String?
     private external fun nativeReset()
+    private external fun nativeIsPaired(): Boolean
+    private external fun nativeGetPairingPlist(): String?
 }
