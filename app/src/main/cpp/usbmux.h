@@ -2,35 +2,30 @@
 /*
  * usbmux.h — Giao thức usbmux của Apple qua USB.
  *
- * Triển khai lại HOÀN TOÀN dựa theo mã nguồn gốc, xác thực byte-for-byte với:
+ * Triển khai lại dựa theo mã nguồn gốc usbmuxd/src/device.c, xác thực với:
  *   libimobiledevice/usbmuxd  src/device.c  (struct mux_header, struct
  *   version_header, enum mux_protocol, send_packet(), device_data_input(),
  *   device_version_input())
  *
- * ⚠️ BUGFIX QUAN TRỌNG (thay thế toàn bộ 3 "fix" SAI của các bản trước):
- *   Bản trước tự nhận đã "so khớp byte-for-byte với usbmuxd" nhưng thực tế
- *   KHÔNG khớp — toàn bộ handshake bị sai, khiến iPhone không bao giờ phản
- *   hồi (không hiện "Tin cậy máy tính này?", USB tự rớt kết nối). Cụ thể:
+ * ⚠️ BUGFIX QUAN TRỌNG (v17 — read-ahead buffer):
+ *   Bản trước (v16) sửa đúng giao thức (VERSION→SETUP, magic 0xfeedface, 16-bit
+ *   seq, layout header đúng) nhưng vẫn bị lỗi "SETUP thất bại" trong thực tế vì:
  *
- *   1. MAGIC sai: dùng 0xFADEDEAD trong khi giao thức thật dùng 0xfeedface.
- *   2. Cấu trúc header sai thứ tự & sai kích thước field: bản trước dùng
- *      magic(4)+version(2)+message(2)+tx_seq(4)+rx_seq(4)+length(4) = 20
- *      bytes cố định. Giao thức thật: protocol(4)+length(4)+magic(4)+
- *      tx_seq(2)+rx_seq(2) = 16 bytes, và CHỈ 8 byte đầu (protocol+length)
- *      được gửi khi phiên bản mux < 2 (tức là gói VERSION đầu tiên).
- *   3. Thiếu hoàn toàn bước bắt tay phiên bản (MUX_PROTO_VERSION, protocol=0)
- *      — bản trước nhảy thẳng vào một gói "SETUP" tự chế (protocol/message=8)
- *      chưa từng tồn tại trong giao thức thật. Giao thức thật: gửi VERSION
- *      (protocol=0, header 8 byte, payload version_header{major,minor,
- *      padding}) trước, nhận phản hồi version từ thiết bị, SAU ĐÓ mới gửi
- *      SETUP (protocol=2, header 16 byte vì version≥2, payload 1 byte 0x07).
- *   4. tx_seq/rx_seq ở mux-header là 16-bit (htons), không phải 32-bit
- *      (htonl) như bản trước.
+ *   recv_packet() đọc 8 byte TRƯỚC (header) rồi đọc phần còn lại. Nhưng iPhone
+ *   gửi toàn bộ packet (ví dụ 20 byte) như MỘT USB bulk transfer. Android USB
+ *   Host API (bulkTransfer) chỉ trả về đúng số byte đã yêu cầu (8 byte) và KHÔNG
+ *   buffering phần dư — 12 byte còn lại BỊ MẤT. Lần đọc tiếp theo gửi IN token
+ *   mới tới iPhone, vốn đã xong việc → timeout → SETUP thất bại.
+ *
+ *   Fix: thêm read-ahead buffer 65536 byte (DEV_MRU từ usbmuxd/src/device.c) vào
+ *   mux_conn_t. buffered_read() lấp đầy buffer bằng một USB bulk read lớn (tối đa
+ *   65536 byte) rồi phục vụ các yêu cầu nhỏ hơn từ buffer đó — đảm bảo không bao
+ *   giờ mất dữ liệu từ một bulk transfer.
+ *
+ *   Ngoài ra thêm ui_log callback để mux_do_setup() gửi log chi tiết lên UI thay
+ *   vì chỉ ghi Logcat — người dùng thấy chính xác bước nào thất bại.
  *
  * enum mux_protocol thật: VERSION=0, CONTROL=1, SETUP=2, TCP=6 (IPPROTO_TCP).
- * (Bản trước dùng MUX_MSG_SETUP=8 và MUX_MSG_TCP=6 — TCP đúng nhưng SETUP sai
- *  hoàn toàn giá trị VÀ sai vai trò: SETUP thật không mang version, VERSION
- *  là một protocol riêng.)
  */
 
 #include <stdint.h>
@@ -56,6 +51,13 @@
 
 /* Cổng lockdownd */
 #define LOCKDOWN_PORT 62078
+
+/*
+ * DEV_MRU — kích thước buffer đọc trước (khớp DEV_MRU trong usbmuxd/src/device.c).
+ * Mỗi lần USB đọc, ta đọc tối đa DEV_MRU byte vào rxbuf để tránh mất dữ liệu
+ * khi iPhone gửi nhiều byte trong một bulk transfer.
+ */
+#define MUX_DEV_MRU 65536
 
 /* ── Struct wire-format (big-endian trên dây, khớp usbmuxd device.c) ─────── */
 #pragma pack(push, 1)
@@ -115,6 +117,29 @@ typedef struct mux_conn {
     /* callbacks vào JNI USB layer */
     int (*usb_write)(const void *buf, int len);
     int (*usb_read )(void *buf, int len);
+
+    /*
+     * Read-ahead buffer (FIX v17).
+     *
+     * Vấn đề: recv_packet() đọc 8 byte (header) rồi N-8 byte (body) bằng 2
+     * lần gọi usb_read riêng biệt. iPhone gửi toàn bộ gói (ví dụ 20 byte)
+     * trong MỘT USB bulk transfer. Android bulkTransfer(8 byte) chỉ trả về 8
+     * byte và 12 byte còn lại BỊ MẤT — không buffered bởi driver.
+     *
+     * Giải pháp: mỗi khi cần dữ liệu, đọc MUX_DEV_MRU byte từ USB vào rxbuf
+     * (giống DEV_MRU = 65536 trong usbmuxd/src/device.c). buffered_read()
+     * phục vụ tất cả yêu cầu nhỏ hơn từ buffer — không bao giờ mất dữ liệu.
+     */
+    uint8_t  rxbuf[MUX_DEV_MRU];
+    int      rxbuf_used;     /* số byte hợp lệ trong rxbuf [0..rxbuf_used) */
+    int      rxbuf_pos;      /* vị trí đọc tiếp theo trong rxbuf */
+
+    /*
+     * UI log callback — nếu được set, mux_do_setup() gọi hàm này để gửi
+     * log chi tiết lên UI (thay vì chỉ ghi Logcat qua LOGI/LOGE).
+     * Set bởi jni_bridge.c sau khi gọi mux_conn_init().
+     */
+    void (*ui_log)(const char *msg);
 } mux_conn_t;
 
 /* ── API ─────────────────────────────────────────────────────────────────── */
@@ -123,6 +148,7 @@ int  mux_conn_init (mux_conn_t *c,
                     int (*usb_read )(void*, int));
 
 /* Thực hiện TOÀN BỘ bắt tay usbmux: gửi VERSION, nhận phản hồi, rồi gửi SETUP.
+ * Nếu c->ui_log != NULL, gọi nó để ghi log chi tiết từng bước lên UI.
  * (Tên hàm giữ nguyên "mux_do_setup" để tương thích ngược với jni_bridge.c,
  *  nhưng bên trong đã bao gồm cả bước VERSION bắt buộc trước SETUP.) */
 int  mux_do_setup (mux_conn_t *c);

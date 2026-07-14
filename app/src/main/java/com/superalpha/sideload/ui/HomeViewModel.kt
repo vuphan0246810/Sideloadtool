@@ -18,6 +18,11 @@ import kotlinx.coroutines.launch
  * SettingsScreen) vẫn lấy qua PythonBridge.listAnisetteServers() — hàm đó giờ
  * gọi thẳng OkHttp tới servers.sidestore.io thay vì Python, và được load một
  * lần rồi cache ở đây để chuyển qua lại tab Cài đặt không phải tải lại mạng.
+ *
+ * BUGFIX v17:
+ *   - Thêm emitLog() để PairingScreen.kt có thể ghi log USB-open lên UI.
+ *   - connectAndPair() vẫn an toàn gọi khi USB đã mở (PairingScreen gọi sau
+ *     khi requestAndOpen() thành công) hoặc trực tiếp (USB đã open sẵn).
  */
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
     val nativeBridge = NativeBridge(app)
@@ -57,6 +62,15 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     fun saveAnisetteUrl(v: String) { _savedAnisetteUrl.value = v; AppConfig.anisetteUrl = v }
     fun dismissTrust() = NativeBridge.dismissTrust()
 
+    /**
+     * emitLog — ghi thẳng một dòng log vào UI log console.
+     *
+     * BUGFIX v17: PairingScreen cần ghi kết quả USB-open (thành công/thất bại)
+     * lên console trước khi gọi connectAndPair(). NativeLog.emit() là cách
+     * chính xác vì HomeViewModel subscribe vào NativeLog.lines để đổ vào _log.
+     */
+    fun emitLog(line: String) = NativeLog.emit(line)
+
     /** Tải danh sách server Anisette công khai một lần rồi cache lại; gọi
      * [reloadAnisetteServers] để buộc tải lại. Gọi an toàn ở mỗi lần
      * SettingsScreen recompose — không làm gì nếu đã có danh sách. */
@@ -90,8 +104,18 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private val _isPaired = MutableStateFlow(false)
     val isPaired: StateFlow<Boolean> = _isPaired
 
-    /** Kết nối USB (nếu chưa) rồi thực hiện toàn bộ luồng pairing native
-     * (Pair → chờ Trust → StartSession/TLS). Cập nhật [isPaired] khi xong. */
+    /**
+     * connectAndPair — thực hiện toàn bộ luồng bắt tay usbmux + pairing native.
+     *
+     * Giả định USB ĐÃ ĐƯỢC MỞ trước khi gọi (UsbTransport.isConnected() == true).
+     * PairingScreen.kt gọi hàm này CHỈ SAU KHI:
+     *   - USB đã kết nối (usbConnected == true), HOẶC
+     *   - UsbPermissionManager.requestAndOpen() thành công.
+     *
+     * nativeBridge.connect() gọi mux_conn_init() + mux_do_setup() trong C.
+     * Với BUGFIX v17 (read-ahead buffer), mux_do_setup() sẽ không còn mất
+     * 12 bytes của VERSION response và SETUP thất bại.
+     */
     fun connectAndPair() {
         if (_busy.value) return
         _busy.value = true

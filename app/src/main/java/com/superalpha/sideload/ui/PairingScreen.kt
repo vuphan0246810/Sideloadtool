@@ -23,7 +23,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,43 +30,45 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import com.superalpha.sideload.bridge.AppConfig
+import com.superalpha.sideload.bridge.UsbPermissionManager
 
 /**
  * PairingScreen — tab "Ghép nối", tách riêng khỏi luồng Cài IPA.
  *
- * Mục đích (theo yêu cầu người dùng): cho phép ghép nối với iPhone và tạo
- * file pairing MÀ KHÔNG cần chọn/ký một IPA trước — hữu ích để:
- *   - Kiểm tra riêng bước ghép nối USB có hoạt động đúng không (bước hay lỗi
- *     nhất, xem BUGFIX usbmux.c/usbmux.h: thiếu bắt tay VERSION trước SETUP).
- *   - Xuất pair record ra file .plist chuẩn (định dạng idevicepair) để lưu
- *     trữ/dùng lại với công cụ khác, hoặc backup trước khi reset ứng dụng.
+ * Mục đích: cho phép ghép nối với iPhone và tạo file pairing MÀ KHÔNG cần
+ * chọn/ký một IPA trước.
  *
- * Luồng: Kết nối USB (UsbPermissionManager) → viewModel.connectAndPair()
- * (nativeConnect + nativePair, tự hiện Trust banner qua PromptDialogHost đã
- * gắn toàn cục ở MainActivity) → khi isPaired=true, cho phép xuất file.
+ * BUGFIX v17 — Luồng nút "Kết nối & Ghép nối iPhone":
+ *   Trước đây nút gọi viewModel.connectAndPair() trực tiếp. Nếu USB chưa
+ *   được mở (người dùng mở app TRƯỚC khi cắm cáp, hoặc UsbTransport.open()
+ *   chưa được gọi), native C sẽ thất bại ngay khi gọi usb_bulk_write vì
+ *   UsbTransport.endpointOut == null → trả -1 → VERSION packet gửi không được
+ *   → mux_do_setup() thất bại ngay bước đầu tiên.
+ *
+ *   Fix: nếu USB chưa kết nối (usbConnected == false), gọi
+ *   UsbPermissionManager.requestAndOpen() trước để mở kết nối USB, rồi khi
+ *   thành công MỚI gọi viewModel.connectAndPair(). Người dùng thấy rõ hướng
+ *   dẫn và không bị "SETUP thất bại" mơ hồ.
+ *
+ * Luồng hoàn chỉnh:
+ *   Nếu USB đã kết nối  → connectAndPair() (VERSION → SETUP → lockdown → Pair)
+ *   Nếu USB chưa kết nối → requestAndOpen() → [thành công] → connectAndPair()
+ *                                           → [thất bại]   → log lỗi rõ ràng
  */
 @Composable
 fun PairingScreen(viewModel: HomeViewModel) {
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
     val logLines by viewModel.log.collectAsState()
     val busy by viewModel.busy.collectAsState()
     val usbConnected by viewModel.usbConnected.collectAsState()
     val isPaired by viewModel.isPaired.collectAsState()
-    val trustRequired by viewModel.trustRequired.collectAsState()
 
     var exportedPath by remember { mutableStateOf<String?>(null) }
     var exporting by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        // Không có cách đọc trạng thái "đã pair" từ trước nếu chưa gọi
-        // connectAndPair() trong session này — native state chỉ tồn tại
-        // trong bộ nhớ tiến trình (không phải đọc lại pair record trên đĩa
-        // lúc mở màn hình), nên nhãn trạng thái mặc định là "chưa ghép nối"
-        // cho tới khi người dùng bấm nút.
-    }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("Ghép nối iPhone", style = MaterialTheme.typography.titleLarge)
@@ -81,53 +82,53 @@ fun PairingScreen(viewModel: HomeViewModel) {
 
         Spacer(Modifier.height(16.dp))
 
+        /* ── Thẻ trạng thái USB / Ghép nối ── */
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
         ) {
-            Column(modifier = Modifier.padding(16.dp)) {
+            Column(modifier = Modifier.padding(12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        Icons.Filled.Usb,
+                        imageVector = Icons.Filled.Usb,
                         contentDescription = null,
-                        tint = if (usbConnected)
-                            com.superalpha.sideload.ui.theme.BrandAccent
-                        else
-                            com.superalpha.sideload.ui.theme.BrandTextDim
+                        tint = if (usbConnected) MaterialTheme.colorScheme.primary
+                               else MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    Spacer(Modifier.height(0.dp).padding(start = 8.dp))
                     Text(
                         text = if (usbConnected) "Đã kết nối USB" else "Chưa kết nối USB",
-                        modifier = Modifier.padding(start = 8.dp)
+                        modifier = Modifier.padding(start = 8.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (usbConnected) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        Icons.Filled.CheckCircle,
+                        imageVector = Icons.Filled.CheckCircle,
                         contentDescription = null,
-                        tint = if (isPaired)
-                            com.superalpha.sideload.ui.theme.BrandAccent
-                        else
-                            com.superalpha.sideload.ui.theme.BrandTextDim
+                        tint = if (isPaired) MaterialTheme.colorScheme.primary
+                               else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = if (isPaired) "Đã ghép nối (paired)" else "Chưa ghép nối",
-                        modifier = Modifier.padding(start = 8.dp)
+                        text = if (isPaired) "Đã ghép nối" else "Chưa ghép nối",
+                        modifier = Modifier.padding(start = 8.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (isPaired) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                if (AppConfig.lastUdid.isNotBlank()) {
+                val udid = AppConfig.lastUdid
+                if (udid.isNotBlank()) {
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "UDID: ${AppConfig.lastUdid}",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-                if (trustRequired) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "⚠️ Kiểm tra màn hình iPhone và bấm \"Tin cậy\" (Trust This Computer).",
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall
+                        text = "UDID: $udid",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -135,14 +136,41 @@ fun PairingScreen(viewModel: HomeViewModel) {
 
         Spacer(Modifier.height(16.dp))
 
+        /*
+         * Nút "Kết nối & Ghép nối iPhone"
+         *
+         * BUGFIX v17: Nếu USB chưa kết nối, gọi UsbPermissionManager.requestAndOpen()
+         * trước. Sau khi USB mở thành công, MỚI gọi connectAndPair().
+         * Tránh lỗi "SETUP thất bại" khi native C gọi usb_bulk_write lúc
+         * UsbTransport chưa được khởi tạo.
+         */
         Button(
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
-            onClick = { viewModel.connectAndPair() }
+            onClick = {
+                if (usbConnected) {
+                    /* USB đã mở sẵn → pair ngay */
+                    viewModel.connectAndPair()
+                } else {
+                    /* USB chưa mở → xin quyền & mở trước */
+                    viewModel.setBusy(true)
+                    UsbPermissionManager.requestAndOpen(
+                        context = context,
+                        fromAutoAttach = false   /* người dùng chủ động bấm → không cooldown */
+                    ) { ok, msg ->
+                        viewModel.emitLog(if (ok) "[usb] \u2705 $msg" else "[usb] \u274c $msg")
+                        if (ok) {
+                            /* USB vừa mở thành công → tiến hành pair */
+                            viewModel.connectAndPair()
+                        } else {
+                            viewModel.setBusy(false)
+                        }
+                    }
+                }
+            }
         ) {
             if (busy) {
                 CircularProgressIndicator(modifier = Modifier.height(16.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.height(0.dp))
                 Text(" Đang ghép nối...", modifier = Modifier.padding(start = 8.dp))
             } else {
                 Icon(Icons.Filled.Link, contentDescription = null)
@@ -174,8 +202,7 @@ fun PairingScreen(viewModel: HomeViewModel) {
                                 Intent.createChooser(shareIntent, "Lưu / chia sẻ file pairing")
                             )
                         } catch (_: Exception) {
-                            // Không có app nào xử lý share — người dùng vẫn thấy
-                            // đường dẫn file qua Text bên dưới.
+                            /* Không có app nào xử lý share — đường dẫn vẫn hiện bên dưới */
                         }
                     }
                 }

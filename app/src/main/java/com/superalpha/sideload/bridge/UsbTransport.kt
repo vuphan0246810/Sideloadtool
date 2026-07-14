@@ -26,7 +26,16 @@ object UsbTransport {
     private const val INTERFACE_CLASS    = 0xFF
     private const val INTERFACE_SUBCLASS = 0xFE
     private const val INTERFACE_PROTOCOL = 0x02
-    const val USB_MRU = 16384
+    /**
+     * USB_MRU — kích thước tối đa của một USB bulk read.
+     *
+     * BUGFIX v17: đặt 65536 (= MUX_DEV_MRU trong usbmux.h) để khớp kích thước
+     * read-ahead buffer trong C. buffered_read() trong usbmux.c gọi
+     * usb_read(rxbuf, sizeof(rxbuf)) = usb_read(rxbuf, 65536). JNI sẽ gọi
+     * nativeBulkRead với ByteArray(65536). Giá trị cũ (16384) chỉ cần thiết nếu
+     * bulkRead() Kotlin được dùng trực tiếp — giờ giữ đồng nhất với C layer.
+     */
+    const val USB_MRU = 65536
 
     @Volatile private var connection: UsbDeviceConnection? = null
     @Volatile private var usbInterface: UsbInterface? = null
