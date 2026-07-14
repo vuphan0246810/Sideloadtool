@@ -125,7 +125,15 @@ char *plist_build_pair_request(const char *req_type,
                                 const char *device_cert_pem,
                                 const char *host_cert_pem,
                                 const char *root_cert_pem,
-                                const char *host_id) {
+                                const char *host_id,
+                                const char *system_buid) {
+    /*
+     * BUGFIX: SystemBUID trước đây hardcoded "00000000-0000-0000-0000-000000000000".
+     * lockdownd dùng SystemBUID để nhận diện host — dùng UUID thật được tạo trong
+     * pairing_do(). Nếu hardcoded, Apple sẽ reject hoặc tạo duplicate pairing record.
+     */
+    const char *buid = (system_buid && system_buid[0]) ? system_buid
+                                                        : "00000000-0000-0000-0000-000000000000";
     char *dc = pem_to_b64(device_cert_pem);
     char *hc = pem_to_b64(host_cert_pem);
     char *rc = pem_to_b64(root_cert_pem);
@@ -141,11 +149,11 @@ char *plist_build_pair_request(const char *req_type,
           "<key>HostCertificate</key><data>%s</data>"
           "<key>RootCertificate</key><data>%s</data>"
           "<key>HostID</key><string>%s</string>"
-          "<key>SystemBUID</key><string>00000000-0000-0000-0000-000000000000</string>"
+          "<key>SystemBUID</key><string>%s</string>"
         "</dict>"
         "<key>Request</key><string>%s</string>"
         "%s",
-        PLIST_HEADER, dc, hc, rc, host_id, req_type, PLIST_FOOTER);
+        PLIST_HEADER, dc, hc, rc, host_id, buid, req_type, PLIST_FOOTER);
     free(dc); free(hc); free(rc);
     return result;
 }
@@ -337,6 +345,22 @@ const char *plist_get_str(plist_dict_t *d, const char *key) {
 long long plist_get_int(plist_dict_t *d, const char *key) {
     for (plist_item_t *i = d->head; i; i = i->next)
         if (strcmp(i->key, key) == 0 && i->type == PLIST_INT) return i->int_val;
+    return 0;
+}
+
+/*
+ * plist_get_bool — đọc giá trị <true/>/<false/> (PLIST_BOOL).
+ *
+ * BUGFIX: EnableSessionSSL và EnableServiceSSL là boolean (<true/>) trong plist
+ * của Apple, KHÔNG phải <string>. plist_get_str() trả NULL cho chúng vì
+ * PLIST_BOOL không set str_val. Kết quả: use_ssl luôn = 0 → TLS không được bật
+ * sau StartSession/StartService, dẫn đến thất bại khi giao tiếp với lockdownd
+ * hoặc các service khác.
+ */
+int plist_get_bool(plist_dict_t *d, const char *key) {
+    if (!d) return 0;
+    for (plist_item_t *i = d->head; i; i = i->next)
+        if (strcmp(i->key, key) == 0 && i->type == PLIST_BOOL) return i->bool_val;
     return 0;
 }
 

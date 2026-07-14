@@ -21,6 +21,18 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+/*
+ * UI_LOGF — ghi log lên cả Logcat VÀ UI (qua mux->ui_log callback).
+ * Dùng trong pairing_do() để người dùng thấy chính xác bước nào thất bại,
+ * thay vì chỉ thấy "Pairing thất bại" mà không biết nguyên nhân.
+ */
+#define UI_LOGF(ld, fmt, ...) do {                                          \
+    char _ui_buf[512];                                                       \
+    snprintf(_ui_buf, sizeof(_ui_buf), "[pairing] " fmt, ##__VA_ARGS__);    \
+    LOGI("%s", _ui_buf);                                                     \
+    if ((ld)->mux && (ld)->mux->ui_log) (ld)->mux->ui_log(_ui_buf);         \
+} while(0)
+
 /* ── JNI helper: gọi CertHelper.generateCertChain(devicePubDer) ─────────── */
 static int jni_generate_certs(JNIEnv *env, const unsigned char *dev_pub_der,
                                int dev_pub_len, pair_record_t *rec) {
@@ -89,63 +101,71 @@ int pairing_do(lockdown_t *ld, pair_record_t *rec_out,
     uuid_generate_random_str(sys_buid);
     rec_out->host_id    = strdup(host_id);
     rec_out->system_buid = strdup(sys_buid);
+    UI_LOGF(ld, "Bước 1/5: HostID=%s", host_id);
 
     /* 2. Lấy DevicePublicKey từ lockdownd */
     char *dev_pub_b64 = NULL;
-    LOGI("[pairing] GetValue(DevicePublicKey)...");
+    UI_LOGF(ld, "Bước 2/5: GetValue(DevicePublicKey)...");
     if (lockdown_get_value(ld, NULL, "DevicePublicKey", &dev_pub_b64) < 0) {
-        LOGE("[pairing] Không lấy được DevicePublicKey");
+        UI_LOGF(ld, "❌ Không lấy được DevicePublicKey từ lockdownd");
         return -1;
     }
-    /* Decode base64 → DER bytes */
+    /* Decode base64 → DER bytes (iPhone gửi PKCS#1 DER trong <data> base64) */
     unsigned char *dev_pub_der = NULL;
-    /* Xoá whitespace khỏi base64 */
     size_t b64_len = strlen(dev_pub_b64);
     char *b64_clean = malloc(b64_len + 1);
     size_t j = 0;
     for (size_t i = 0; i < b64_len; i++)
-        if (dev_pub_b64[i] != '\n' && dev_pub_b64[i] != '\r')
+        if (dev_pub_b64[i] != '\n' && dev_pub_b64[i] != '\r' && dev_pub_b64[i] != ' ')
             b64_clean[j++] = dev_pub_b64[i];
     b64_clean[j] = '\0';
     free(dev_pub_b64);
 
     size_t der_len = b64_decode(b64_clean, &dev_pub_der);
     free(b64_clean);
-    LOGI("[pairing] DevicePublicKey DER: %zu bytes", der_len);
+    UI_LOGF(ld, "DevicePublicKey PKCS#1 DER: %zu byte", der_len);
 
     /* 3. Tạo cert chain qua CertHelper (JNI) */
-    LOGI("[pairing] Gọi CertHelper.generateCertChain...");
+    UI_LOGF(ld, "Bước 3/5: Tạo cert chain (RSA 2048)...");
     if (jni_generate_certs(env, dev_pub_der, (int)der_len, rec_out) < 0) {
         free(dev_pub_der);
+        UI_LOGF(ld, "❌ CertHelper.generateCertChain thất bại — xem Logcat để biết chi tiết");
         return -1;
     }
     free(dev_pub_der);
+    UI_LOGF(ld, "✅ Cert chain tạo thành công");
 
     /* 4. Gửi Pair request */
-    LOGI("[pairing] Gửi Pair request...");
+    UI_LOGF(ld, "Bước 4/5: Gửi Pair request đến lockdownd...");
     char *pair_req = plist_build_pair_request("Pair",
         rec_out->device_cert_pem,
         rec_out->host_cert_pem,
         rec_out->root_cert_pem,
-        host_id);
-    if (!pair_req) return -1;
+        host_id,
+        sys_buid);  /* FIX: truyền SystemBUID thật thay vì hardcoded zeros */
+    if (!pair_req) { UI_LOGF(ld, "❌ Không build được pair request XML"); return -1; }
 
     plist_dict_t *pair_resp = NULL;
     if (lockdown_exchange(ld, pair_req, &pair_resp) < 0) {
         free(pair_req);
-        LOGE("[pairing] Gửi Pair request thất bại");
+        UI_LOGF(ld, "❌ Gửi/nhận Pair request thất bại (mất kết nối?)");
         return -1;
     }
     free(pair_req);
 
     /* 5. Kiểm tra response — xử lý PairingDialogResponsePending */
     const char *err = pair_resp ? plist_get_str(pair_resp, "Error") : "NullResponse";
-    if (pair_resp && err && strcmp(err, "PairingDialogResponsePending") == 0) {
-        plist_free(pair_resp);
-        LOGI("[pairing] PairingDialogResponsePending → thông báo UI, chờ tối đa 120s");
-        jni_notify_trust(env);  /* Hiện banner Trust trên UI */
+    if (!pair_resp || strcmp(err ? err : "", "NullResponse") == 0) {
+        UI_LOGF(ld, "❌ Lockdownd không trả về phản hồi (null response)");
+        if (pair_resp) plist_free(pair_resp);
+        return -1;
+    }
 
-        /* Poll mỗi 3 giây trong 120 giây */
+    if (err && strcmp(err, "PairingDialogResponsePending") == 0) {
+        plist_free(pair_resp);
+        UI_LOGF(ld, "Bước 5/5: Chờ người dùng bấm Trust trên iPhone (tối đa 120s)...");
+        jni_notify_trust(env);
+
         int waited = 0;
         int success = 0;
         while (waited < 120) {
@@ -155,44 +175,44 @@ int pairing_do(lockdown_t *ld, pair_record_t *rec_out,
                 rec_out->device_cert_pem,
                 rec_out->host_cert_pem,
                 rec_out->root_cert_pem,
-                host_id);
+                host_id,
+                sys_buid);
             plist_dict_t *retry_resp = NULL;
             lockdown_exchange(ld, retry_req, &retry_resp);
             free(retry_req);
 
-            const char *re = retry_resp ? plist_get_str(retry_resp, "Error") : "null";
+            const char *re = retry_resp ? plist_get_str(retry_resp, "Error") : NULL;
             if (!re) {
-                /* Không có Error = Success */
-                LOGI("[pairing] ✅ Người dùng đã bấm Trust! (%ds)", waited);
+                UI_LOGF(ld, "✅ Người dùng đã bấm Trust sau %ds", waited);
                 plist_free(retry_resp);
                 success = 1;
                 break;
             }
             if (strcmp(re, "PairingDialogResponsePending") == 0) {
-                LOGI("[pairing] Vẫn chờ Trust... (%d/%ds)", waited, 120);
+                UI_LOGF(ld, "Vẫn chờ Trust... (%d/120s)", waited);
                 plist_free(retry_resp);
                 continue;
             }
-            LOGE("[pairing] Lỗi khi chờ Trust: %s", re);
+            UI_LOGF(ld, "❌ Lỗi khi chờ Trust: %s", re);
             plist_free(retry_resp);
             jni_dismiss_trust(env);
             return -1;
         }
         jni_dismiss_trust(env);
         if (!success) {
-            LOGE("[pairing] Hết thời gian chờ Trust (120s)");
+            UI_LOGF(ld, "❌ Hết thời gian chờ Trust (120s)");
             return -1;
         }
-    } else if (pair_resp && err) {
-        LOGE("[pairing] Pair thất bại: %s", err);
+    } else if (err) {
+        UI_LOGF(ld, "❌ Pair thất bại — lockdownd trả lỗi: %s", err);
         plist_free(pair_resp);
         return -1;
     } else {
-        if (pair_resp) plist_free(pair_resp);
-        LOGI("[pairing] ✅ Pair thành công ngay (thiết bị đã được tin cậy trước đó)");
+        plist_free(pair_resp);
+        UI_LOGF(ld, "✅ Pair thành công ngay (thiết bị đã được tin cậy trước đó)");
     }
 
-    LOGI("[pairing] ✅ Pairing hoàn tất. HostID=%s", host_id);
+    UI_LOGF(ld, "✅ Pairing hoàn tất. HostID=%s", host_id);
     return 0;
 }
 

@@ -306,8 +306,13 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(
     lockdown_exchange(&g_ld, start_sess_req, &ss_resp);
     free(start_sess_req);
 
-    const char *use_ssl_str = ss_resp ? plist_get_str(ss_resp, "EnableSessionSSL") : NULL;
-    int use_ssl = use_ssl_str && strcmp(use_ssl_str, "true") == 0;
+    /*
+     * BUGFIX: EnableSessionSSL là <true/> boolean trong plist Apple — KHÔNG phải
+     * <string>. plist_get_str() trả NULL cho boolean → use_ssl luôn = 0 → TLS
+     * không được bật sau StartSession → lockdownd close connection.
+     * Dùng plist_get_bool() thay thế.
+     */
+    int use_ssl = ss_resp ? plist_get_bool(ss_resp, "EnableSessionSSL") : 0;
     if (ss_resp) plist_free(ss_resp);
 
     if (use_ssl) {

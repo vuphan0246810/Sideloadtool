@@ -103,9 +103,17 @@ int lockdown_get_value(lockdown_t *ld, const char *domain,
     free(req);
     if (r < 0 || !resp) return -1;
 
+    /* BUGFIX: kiểm tra Error trước khi đọc Value */
+    const char *err = plist_get_str(resp, "Error");
+    if (err) {
+        LOGE("lockdown_get_value(%s): lockdownd trả lỗi: %s", key ? key : "all", err);
+        plist_free(resp);
+        return -1;
+    }
     const char *val = plist_get_str(resp, "Value");
     if (val && val_out) *val_out = strdup(val);
     plist_free(resp);
+    if (!val) LOGE("lockdown_get_value(%s): không tìm thấy trường Value trong response", key ? key : "all");
     return val ? 0 : -1;
 }
 
@@ -125,8 +133,12 @@ int lockdown_start_service(lockdown_t *ld, const char *service,
         return -1;
     }
     long long port = plist_get_int(resp, "Port");
-    const char *use_ssl_s = plist_get_str(resp, "EnableServiceSSL");
-    int use_ssl = use_ssl_s && strcmp(use_ssl_s, "true") == 0;
+    /*
+     * BUGFIX: EnableServiceSSL là <true/> boolean trong plist của Apple — KHÔNG
+     * phải <string>. plist_get_str() luôn trả NULL cho nó → use_ssl luôn = 0.
+     * Dùng plist_get_bool() thay thế.
+     */
+    int use_ssl = plist_get_bool(resp, "EnableServiceSSL");
     plist_free(resp);
 
     if (port_out) *port_out = (int)port;

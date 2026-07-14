@@ -35,7 +35,8 @@ char *plist_build_pair_request(const char *req_type,
                                 const char *device_cert_pem,
                                 const char *host_cert_pem,
                                 const char *root_cert_pem,
-                                const char *host_id);
+                                const char *host_id,
+                                const char *system_buid);
 char *plist_build_start_service(const char *service_name);
 char *plist_build_start_session(const char *system_buid, const char *host_id);
 char *plist_build_install_request(const char *pkg_path);
@@ -58,6 +59,10 @@ char *plist_build_pairing_export(const char *udid,
 plist_dict_t *plist_parse(const char *xml);
 const char   *plist_get_str (plist_dict_t *d, const char *key);
 long long     plist_get_int (plist_dict_t *d, const char *key);
+/* plist_get_bool: trả về 1 nếu key tồn tại và có type <true/>, ngược lại 0.
+ * Dùng cho EnableSessionSSL, EnableServiceSSL — đây là PLIST_BOOL, không phải
+ * PLIST_STR, nên plist_get_str() sẽ trả NULL cho chúng. */
+int           plist_get_bool(plist_dict_t *d, const char *key);
 void          plist_free    (plist_dict_t *d);
 
 /* ── Base64 ─────────────────────────────────────────────────────────────── */
