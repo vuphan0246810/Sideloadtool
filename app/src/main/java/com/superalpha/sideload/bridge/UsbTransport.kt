@@ -88,32 +88,59 @@ object UsbTransport {
             lastError = "openDevice() trả null — quyền USB chưa được cấp"; return false
         }
 
-        // FIX: Đợi OS sẵn sàng trước khi claim (Android USB timing issue).
-        // Nhiều thiết bị iOS cần khoảng delay nhỏ sau openDevice() để kernel
-        // driver hoàn tất quá trình handoff — thiếu delay này claimInterface()
-        // luôn trả false dù forceClaim = true.
-        try { Thread.sleep(150) } catch (_: InterruptedException) {}
+        // ── FIX ROOT CAUSE claimInterface ─────────────────────────────────────
+        // Root cause thực sự của lỗi claimInterface() luôn trả false:
+        //
+        //   Android gọi openDevice() → trả UsbDeviceConnection hợp lệ, NHƯNG
+        //   thiết bị iOS lúc này có thể đang ở USB configuration 0 (unconfigured)
+        //   hoặc ở một configuration khác không chứa usbmux interface (class=0xFF).
+        //
+        //   findUsbmuxInterfaceWithConfig() tìm interface trong DESCRIPTOR (chỉ
+        //   là metadata), không phải trong hardware state hiện tại. Nếu hardware
+        //   chưa được set về đúng configuration, claimInterface() luôn fail dù
+        //   forceClaim=true — vì interface đó chưa "tồn tại" ở hardware level.
+        //
+        // Fix: Gọi setConfiguration(found.config) TRƯỚC claimInterface().
+        //   setConfiguration() gửi USB SET_CONFIGURATION request xuống device,
+        //   chuyển hardware sang configuration chứa usbmux interface. Sau đó
+        //   claimInterface() mới có thể claim thành công.
+        //
+        // Tham chiếu: libimobiledevice-android, pymobiledevice3 USB backend,
+        //   Android USB Host API Guide §"Communicating with a device".
+        // ─────────────────────────────────────────────────────────────────────
+        try {
+            val ok = conn.setConfiguration(found.config)
+            Log.i(TAG, "setConfiguration(${found.config.id}) → $ok")
+        } catch (e: Exception) {
+            // Có thể fail nếu device đã ở đúng config — tiếp tục, không return
+            Log.w(TAG, "setConfiguration() exception (ignored): ${e.message}")
+        }
 
-        // FIX: Retry tối đa 5 lần với delay tăng dần trước khi bỏ cuộc.
-        // (200ms → 400ms → 600ms → 800ms giữa các lần thử)
+        // Cho USB subsystem và iOS device thời gian xử lý SET_CONFIGURATION
+        try { Thread.sleep(500) } catch (_: InterruptedException) {}
+
+        // Retry tối đa 8 lần, delay tăng theo cap 2000ms
         var claimed = false
-        for (attempt in 1..5) {
+        for (attempt in 1..8) {
             if (conn.claimInterface(iface, true)) {
                 claimed = true
+                Log.i(TAG, "✅ claimInterface() thành công ở lần $attempt")
                 break
             }
-            if (attempt < 5) {
-                Log.w(TAG, "claimInterface() thất bại lần $attempt/$5, thử lại sau ${attempt * 200}ms...")
-                try { Thread.sleep(attempt * 200L) } catch (_: InterruptedException) {}
-            }
+            val delay = minOf(attempt * 300L, 2000L)
+            Log.w(TAG, "claimInterface() thất bại lần $attempt/8, thử lại sau ${delay}ms…")
+            try { Thread.sleep(delay) } catch (_: InterruptedException) {}
         }
 
         if (!claimed) {
             conn.close()
-            lastError = "claimInterface() thất bại sau 5 lần thử — thử rút và cắm lại cáp USB"
+            lastError = "claimInterface() thất bại sau 8 lần thử — thử rút/cắm lại cáp USB"
             Log.e(TAG, lastError!!)
             return false
         }
+
+        // setInterface() sau claim — đảm bảo alternate setting = 0 được kích hoạt
+        try { conn.setInterface(iface) } catch (_: Exception) {}
 
         connection = conn
         usbInterface = iface

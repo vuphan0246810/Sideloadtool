@@ -38,7 +38,9 @@ object TlsHelper {
         val engine = SSLContext.getInstance("TLS").also { it.init(kmf.keyManagers, trustAll, SecureRandom()) }
             .createSSLEngine().apply {
                 useClientMode = true
-                enabledProtocols = arrayOf("TLSv1", "TLSv1.1", "TLSv1.2")
+                /* BUGFIX v11: TLS 1.0 và 1.1 bị Android 10+ vô hiệu hóa theo mặc định.
+                 * lockdownd của Apple yêu cầu TLS 1.2 — chỉ bật đúng phiên bản này. */
+                enabledProtocols = arrayOf("TLSv1.2")
             }
         val ok = doHandshake(engine, connPtr)
         if (ok) Log.i(TAG, "✅ TLS handshake thành công conn=$connPtr")

@@ -211,14 +211,17 @@ def do_sideload(
         print("Đang đăng nhập Apple ID...")
         effective_anisette = anisette_url or config_manager.get_anisette_url()
         auth = AppleAuth(anisette_url=effective_anisette or None)
-        session = auth.sign_in(apple_id, password)
-        if not session:
+        # BUGFIX v11: AppleAuth dùng authenticate() không phải sign_in()
+        session = auth.authenticate(apple_id, password)
+        if not session or not session.get("authenticated"):
             print("❌ Đăng nhập Apple ID thất bại.")
             return False
         print("✅ Đăng nhập thành công.")
 
         # ── Lấy Development Team ─────────────────────────────────────────────
-        dev_api = DeveloperAPI(session)
+        # BUGFIX v11: DeveloperAPI cần (auth_object, dsid, session_token) —
+        # không phải session dict. auth.session là requests.Session dùng để gọi HTTP.
+        dev_api = DeveloperAPI(auth, session["dsid"], session["session_token"])
         teams = dev_api.list_teams()
         if not teams:
             print("❌ Không lấy được Development Team.")
@@ -242,23 +245,38 @@ def do_sideload(
 
         if not reuse_cert:
             print("Đang tạo certificate mới...")
-            import cryptography.hazmat.primitives.asymmetric.rsa as _rsa
-            import cryptography.hazmat.backends as _backends
-            from cryptography.hazmat.primitives import serialization as _ser
-            private_key = _rsa.generate_private_key(
-                public_exponent=65537, key_size=2048, backend=_backends.default_backend()
-            )
-            key_pem = private_key.private_bytes(
-                _ser.Encoding.PEM, _ser.PrivateFormat.TraditionalOpenSSL, _ser.NoEncryption()
-            ).decode()
-
-            csr_pem = dev_api.generate_csr(private_key)
-            cert_data = dev_api.create_certificate(csr_pem)
+            # BUGFIX v11: create_certificate() tự sinh RSA key + CSR nội bộ.
+            # Không gọi generate_csr() (không tồn tại) hay truyền arg vào.
+            # Kết quả trả về: {"certificateId":..., "certContent":..., "_private_key_pem":...}
+            cert_data = dev_api.create_certificate()
             if not cert_data:
                 print("❌ Không tạo được certificate.")
                 return False
-            cert_id  = cert_data.get("id")
-            cert_pem = decode_apple_data_field(cert_data.get("attributes", {}).get("certificateContent", ""))
+
+            cert_id = cert_data.get("certificateId") or cert_data.get("id", "")
+            # certContent là DER bytes (đã được decode_apple_data_field xử lý)
+            raw_cert = cert_data.get("certContent") or cert_data.get("certificateContent") or b""
+            cert_bytes = decode_apple_data_field(raw_cert)
+            if not cert_bytes:
+                print("❌ Không lấy được nội dung certificate (certContent rỗng).")
+                return False
+            # Chuyển DER → PEM để zsign đọc được
+            import base64 as _b64
+            if isinstance(cert_bytes, bytes) and not cert_bytes.startswith(b"-----"):
+                cert_pem = (
+                    "-----BEGIN CERTIFICATE-----\n"
+                    + _b64.encodebytes(cert_bytes).decode("ascii")
+                    + "-----END CERTIFICATE-----\n"
+                )
+            else:
+                cert_pem = cert_bytes.decode("utf-8") if isinstance(cert_bytes, bytes) else cert_bytes
+
+            # _private_key_pem đã là PEM (TraditionalOpenSSL) từ cryptography lib
+            key_pem = cert_data.get("_private_key_pem", "")
+            if not key_pem:
+                print("❌ Không lấy được private key từ create_certificate().")
+                return False
+
             state.update({"certificate_id": cert_id, "certificate_pem": cert_pem, "private_key_pem": key_pem})
             _save_state(state)
             print(f"✅ Tạo certificate thành công: {cert_id}")
@@ -270,21 +288,31 @@ def do_sideload(
         with open(key_file,  "w") as f: f.write(key_pem)
 
         # ── App ID ────────────────────────────────────────────────────────────
+        # BUGFIX v11: list_app_ids() dùng old plist API → trả về list có
+        # "identifier" (bundle ID) và "appIdId" (internal ID) ở top-level,
+        # không có lớp "attributes" như App Store Connect v1.
         safe_bundle = bundle_id.replace("_", "-")
         full_app_id = f"{team_id}.{safe_bundle}"
         app_ids = dev_api.list_app_ids()
-        existing_id = next((a for a in app_ids if a.get("attributes", {}).get("identifier") == full_app_id), None)
+        existing_id = next(
+            (a for a in app_ids
+             if (a.get("identifier") or a.get("attributes", {}).get("identifier", "")) == full_app_id),
+            None
+        )
         if existing_id:
-            app_id_id = existing_id.get("id")
+            # Old plist API dùng "appIdId", App Store Connect v1 dùng "id"
+            app_id_id = existing_id.get("appIdId") or existing_id.get("id")
             print(f"Dùng lại App ID: {full_app_id}")
         else:
             print(f"Đang tạo App ID: {full_app_id}")
-            result = dev_api.create_app_id(safe_bundle, app_name, team_id)
+            # BUGFIX v11: create_app_id() chỉ nhận (bundle_id, name) —
+            # team_id đã được set_team() đặt vào dev_api.team_id rồi.
+            result = dev_api.create_app_id(safe_bundle, app_name)
             if not result:
-                err_msg = classify_app_id_error(dev_api.last_error())
+                err_msg = classify_app_id_error(dev_api.last_error)
                 print(f"❌ Không tạo được App ID: {err_msg}")
                 return False
-            app_id_id = result.get("id")
+            app_id_id = result.get("appIdId") or result.get("id")
             print(f"✅ Tạo App ID thành công: {full_app_id}")
 
         # ── Provisioning Profile ──────────────────────────────────────────────
@@ -292,21 +320,34 @@ def do_sideload(
         udid = udid_override or _current_udid or config_manager.get_connected_udid() or str(AppPaths.filesDir())
 
         # Đăng ký UDID thiết bị nếu chưa có
+        # BUGFIX v11: list_devices() dùng old plist API → device dict có
+        # "deviceNumber" (UDID), không có lớp "attributes" như v1 API.
         devices = dev_api.list_devices()
-        registered = any(d.get("attributes", {}).get("udid") == udid for d in devices)
+        registered = any(
+            (d.get("deviceNumber") or d.get("attributes", {}).get("udid", "")) == udid
+            for d in devices
+        )
         if not registered:
             print(f"Đang đăng ký thiết bị UDID: {udid}")
             dev_api.register_device(udid, "Android Sideload Device")
 
-        profile_data = dev_api.create_provisioning_profile(app_id_id, cert_id, [udid])
+        # BUGFIX v11: download_provisioning_profile(appIdId) là method đúng.
+        # create_provisioning_profile() không tồn tại trong developer_api.py.
+        # Old plist API trả về provisioningProfile.encodedProfile (base64 DER).
+        profile_data = dev_api.download_provisioning_profile(app_id_id)
         if not profile_data:
-            print("❌ Không tạo được Provisioning Profile.")
+            print("❌ Không tải được Provisioning Profile.")
             return False
-        profile_bytes = decode_apple_data_field(profile_data.get("attributes", {}).get("profileContent", ""))
+        # encodedProfile từ old API (không phải attributes.profileContent từ v1)
+        raw_profile = profile_data.get("encodedProfile") or profile_data.get("profileContent") or ""
+        profile_bytes = decode_apple_data_field(raw_profile)
+        if not profile_bytes:
+            print("❌ Provisioning Profile rỗng sau decode.")
+            return False
         profile_file  = os.path.join(work_dir, "profile.mobileprovision")
         with open(profile_file, "wb") as f:
             f.write(profile_bytes if isinstance(profile_bytes, bytes) else profile_bytes.encode())
-        print("✅ Tạo Provisioning Profile thành công.")
+        print("✅ Tải Provisioning Profile thành công.")
 
         # Đặt bundle ID đã sửa vào app bundle
         set_bundle_id(app_dir, f"{team_id}.{safe_bundle}")
@@ -359,12 +400,14 @@ def do_revoke_certs(
         print("Đang đăng nhập & tra cứu chứng chỉ...")
         effective_anisette = anisette_url or config_manager.get_anisette_url()
         auth = AppleAuth(anisette_url=effective_anisette or None)
-        session = auth.sign_in(apple_id, password)
-        if not session:
+        # BUGFIX v11: authenticate() — không phải sign_in()
+        session = auth.authenticate(apple_id, password)
+        if not session or not session.get("authenticated"):
             print("❌ Đăng nhập Apple ID thất bại.")
             return False
 
-        dev_api = DeveloperAPI(session)
+        # BUGFIX v11: DeveloperAPI(auth, dsid, session_token) — không phải DeveloperAPI(session)
+        dev_api = DeveloperAPI(auth, session["dsid"], session["session_token"])
         teams = dev_api.list_teams()
         if not teams:
             print("❌ Không lấy được team.")

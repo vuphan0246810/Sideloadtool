@@ -240,16 +240,34 @@ int mux_recv(mux_conn_t *c, void *buf, int maxlen) {
     mux_header_t *mh = (mux_header_t *)hdr_buf;
     c->dev_rx_seq = ntohl(mh->tx_seq);
     uint32_t total = ntohl(mh->length);
-    uint32_t payload = total - sizeof(mux_header_t) - sizeof(tcp_header_t);
-    if (payload == 0) return 0;
-    if ((int)payload > maxlen) payload = maxlen;
+    uint32_t full_payload = total - sizeof(mux_header_t) - sizeof(tcp_header_t);
+    if (full_payload == 0) return 0;
+
+    /* BUGFIX v11: Tính read_len riêng, sau đó drain phần dư thay vì bỏ qua.
+     * Nếu không drain, bytes thừa sẽ nằm lại trong USB buffer và làm hỏng
+     * header của packet tiếp theo → toàn bộ mux bị desync sau lần đầu tiên
+     * caller truyền maxlen nhỏ hơn payload thực tế. */
+    uint32_t read_len = ((uint32_t)maxlen < full_payload) ? (uint32_t)maxlen : full_payload;
 
     tcp_header_t *th = (tcp_header_t *)(hdr_buf + sizeof(mux_header_t));
     c->rx_window = ntohs(th->wnd);
 
-    int got = read_all(c, buf, payload);
+    int got = read_all(c, buf, (int)read_len);
     if (got < 0) return -1;
     c->rx_seq += got;
+
+    /* Drain any remaining bytes that didn't fit in the caller's buffer */
+    uint32_t excess = full_payload - read_len;
+    if (excess > 0) {
+        char drain_buf[512];
+        uint32_t drained = 0;
+        while (drained < excess) {
+            int chunk = (int)((excess - drained) < sizeof(drain_buf)
+                              ? (excess - drained) : sizeof(drain_buf));
+            if (read_all(c, drain_buf, chunk) < 0) break;
+            drained += (uint32_t)chunk;
+        }
+    }
 
     /* Gửi ACK ngay */
     uint8_t ack_pkt[sizeof(mux_header_t) + sizeof(tcp_header_t)];

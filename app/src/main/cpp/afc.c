@@ -58,10 +58,11 @@ static int afc_recv_pkt(afc_t *a, afc_header_t *hdr_out,
         if (payload_len_out) *payload_len_out = 0;
     }
 
-    /* Jika entire_length > this_length, ada data terpisah (misalnya AFC_OP_DATA) */
+    /* BUGFIX v11: Luôn drain extra bytes (entire_length > this_length), bất kể
+     * payload_out có NULL hay không.  Nếu không drain, các bytes thừa sẽ nằm lại
+     * trong USB buffer và làm hỏng packet tiếp theo (gây ra lỗi "unexpected op"). */
     uint64_t extra = entire - this_l;
-    if (extra > 0 && !payload_out) {
-        /* Drain extra data if not needed */
+    if (extra > 0) {
         char tmp[1024];
         while (extra > 0) {
             int n = (int)(extra < sizeof(tmp) ? extra : sizeof(tmp));
