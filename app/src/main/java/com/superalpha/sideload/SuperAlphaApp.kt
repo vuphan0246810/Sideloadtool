@@ -8,16 +8,33 @@ import android.content.IntentFilter
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
 import com.superalpha.sideload.bridge.AppConfig
+import com.superalpha.sideload.bridge.AppPaths
+import com.superalpha.sideload.bridge.DeviceNative
 import com.superalpha.sideload.bridge.NativeLog
 import com.superalpha.sideload.bridge.UsbTransport
 
-/** ĐÃ SỬA: Xoá Python (Chaquopy), thêm AppConfig.init(). */
+/**
+ * v8: Khôi phục Chaquopy Python cho apple_auth / developer_api / sideload_core.
+ * USB/lockdown vẫn dùng native C — chỉ mux_usb.py và device_link.py được port sang native.
+ */
 class SuperAlphaApp : Application() {
     override fun onCreate() {
         super.onCreate()
         AppConfig.init(this)
-        NativeLog.emit("[app] SuperAlpha Sideload khởi động (native C mode).")
+        AppPaths.init(this)
+
+        // ── Khởi động Python runtime (Chaquopy) ──────────────────────────────
+        if (!Python.isStarted()) {
+            Python.start(AndroidPlatform(this))
+        }
+
+        // ── Khởi tạo DeviceNative với application context ────────────────────
+        DeviceNative.init(this)
+
+        NativeLog.emit("[app] SuperAlpha Sideload khởi động (native USB + Python API mode).")
         registerUsbDetachReceiver()
     }
 

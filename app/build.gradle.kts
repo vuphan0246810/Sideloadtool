@@ -1,10 +1,14 @@
 /*
- * ĐÃ SỬA: Xoá Chaquopy Python, thêm CMake NDK (libsideloadnative.so),
- * thêm BouncyCastle cho CertHelper.kt.
+ * ĐÃ SỬA v8: Khôi phục Chaquopy Python cho apple_auth/developer_api/sideload_core.
+ * USB/lockdown vẫn dùng native C (libsideloadnative.so).
+ * Chỉ mux_usb.py và device_link.py được port sang native — các file Python khác
+ * (apple_auth.py, developer_api.py, sideload_core.py, config_manager.py, utils.py)
+ * chạy qua Chaquopy như trước.
  */
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("com.chaquo.python")
 }
 
 android {
@@ -20,6 +24,19 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake { cppFlags(""); arguments("-DANDROID_STL=c++_shared") }
+        }
+
+        // ── Chaquopy Python runtime ─────────────────────────────────────────
+        python {
+            // Các gói Python cần thiết:
+            //   requests    — HTTP client cho apple_auth.py / developer_api.py
+            //   cryptography— RSA/SSL cho device_link SSL temp cert và signing
+            //   srp         — SRP auth cho apple_auth.py (đăng nhập Apple ID)
+            pip {
+                install("requests")
+                install("cryptography")
+                install("srp")
+            }
         }
     }
 
@@ -43,9 +60,6 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
-            // bcprov/bcutil/bcpkix-jdk18on đều đóng gói cùng 1 file OSGi manifest ở
-            // đường dẫn multi-release này -> mergeDebugJavaResource báo trùng file.
-            // Nội dung file này không được app dùng tới nên loại bỏ là an toàn.
             excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
         }
         jniLibs { useLegacyPackaging = true }
@@ -76,7 +90,7 @@ dependencies {
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 
-    // OkHttp — dùng cho Apple Developer API calls
+    // OkHttp — dùng cho listAnisetteServers() trong PythonBridge.kt
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
