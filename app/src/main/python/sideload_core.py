@@ -16,7 +16,9 @@ import builtins
 import hashlib
 import os
 import plistlib
+import random
 import shutil
+import string
 import sys
 import time
 import uuid
@@ -178,6 +180,142 @@ def _clear_cert_from_state(state: dict):
     _save_state(state)
 
 
+# ── App ID resolution ─────────────────────────────────────────────────────────
+#
+# BUGFIX v13 [CRITICAL]: Trước đây, khi Apple trả resultCode 9401 ("An App ID
+# with Identifier '...' is not available. Please enter a different string.")
+# — đúng lỗi thấy trong log người dùng report với 'com.SideStore.SideStore' —
+# code CHỈ gọi classify_app_id_error() để in ra một thông báo lỗi thân thiện
+# hơn, RỒI VẪN return False NGAY, bỏ cuộc hoàn toàn. Docstring của FIX-4 trong
+# developer_api.py (classify_app_id_error/delete_app_id) đã ghi rõ ý định
+# "nền tảng cho chức năng tự động đổi bundle id khi bị trùng" và tham chiếu
+# một hàm `sideload_core.py::_resolve_app_id()` — nhưng hàm đó CHƯA TỪNG được
+# viết. Nói cách khác: hạ tầng phân loại lỗi đã có, nhưng phần XỬ LÝ THẬT bị
+# thiếu — đây chính là lý do "Ký & Cài đặt" luôn thất bại với bundle id phổ
+# biến (SideStore, AltStore, ...) đã bị hàng nghìn tài khoản khác đăng ký mất,
+# vì App ID là chuỗi DUY NHẤT TOÀN CẦU trên Apple Developer, không chỉ trong
+# phạm vi tài khoản của bạn.
+#
+# _resolve_app_id() bên dưới lấp đúng lỗ hổng này:
+#   - 'unavailable' (9401): tự thêm hậu tố ngẫu nhiên vào bundle id và thử
+#     lại (tối đa 5 lần) — đúng cách AltStore/SideStore/Sideloadly xử lý.
+#   - 'quota' (giới hạn 10 App ID mới/7 ngày của tài khoản free): tự xoá 1
+#     App ID cũ do CHÍNH TOOL NÀY tạo trước đó (tra trong registry cục bộ
+#     state["app_id_map"], KHÔNG bao giờ đụng App ID không rõ nguồn gốc) để
+#     giải phóng hạn mức, rồi thử lại.
+#   - Kết quả (bundle id hiệu lực + appIdId) được lưu lại trong state để lần
+#     sideload SAU của CÙNG app trên CÙNG tài khoản dùng lại đúng App ID đó,
+#     tránh vừa tốn thêm App ID trong hạn mức mỗi lần bấm "Ký & Cài đặt", vừa
+#     tránh cài app đó thành 2 bản riêng biệt trên máy chỉ vì bundle id đổi
+#     ngẫu nhiên mỗi lần.
+
+_APP_ID_UNAVAILABLE_MAX_RETRIES = 5
+
+
+def _random_bundle_suffix(length: int = 5) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+def _find_app_id_by_bundle(dev_api: "DeveloperAPI", team_id: str, bundle: str):
+    """Tra list_app_ids() cho identifier == '{team_id}.{bundle}' (định dạng
+    Apple trả về từ old plist API — xem BUGFIX v11/BUG-5). Trả về appIdId
+    hoặc None."""
+    full_id = f"{team_id}.{bundle}"
+    for a in dev_api.list_app_ids():
+        identifier = a.get("identifier") or a.get("attributes", {}).get("identifier", "")
+        if identifier == full_id:
+            return a.get("appIdId") or a.get("id")
+    return None
+
+
+def _free_one_own_app_id(dev_api: "DeveloperAPI", state: dict, skip_map_key: str = None) -> bool:
+    """Xoá 1 App ID cũ do CHÍNH TOOL NÀY tạo (tra trong state["app_id_map"])
+    để giải phóng hạn mức 10 App ID mới/7 ngày. KHÔNG xoá App ID đang cần
+    dùng (skip_map_key) và KHÔNG đụng App ID nào không có trong registry cục
+    bộ này — App ID lạ có thể do Xcode hoặc app khác của người dùng tạo."""
+    app_id_map = state.setdefault("app_id_map", {})
+    for key, entry in list(app_id_map.items()):
+        if key == skip_map_key:
+            continue
+        app_id_id = entry.get("app_id_id")
+        if not app_id_id:
+            continue
+        if dev_api.delete_app_id(app_id_id):
+            app_id_map.pop(key, None)
+            _save_state(state)
+            return True
+    return False
+
+
+def _resolve_app_id(dev_api: "DeveloperAPI", team_id: str, base_bundle: str, app_name: str, state: dict):
+    """Tạo hoặc tái sử dụng App ID cho base_bundle. Trả về
+    (effective_bundle_id, app_id_id), hoặc (None, None) nếu thất bại hẳn."""
+    map_key = f"{team_id}:{base_bundle}"
+    app_id_map = state.setdefault("app_id_map", {})
+
+    # 1) Đã "chốt" một bundle id hiệu lực cho đúng app + team này trước đây?
+    cached = app_id_map.get(map_key)
+    if cached:
+        effective_bundle = cached.get("effective_bundle", base_bundle)
+        app_id_id = _find_app_id_by_bundle(dev_api, team_id, effective_bundle)
+        if app_id_id:
+            print(f"Dùng lại App ID đã chốt trước đó: {team_id}.{effective_bundle}")
+            return effective_bundle, app_id_id
+        # App ID đã biến mất phía Apple (vd hết hạn/bị revoke) — xoá cache hỏng.
+        app_id_map.pop(map_key, None)
+
+    # 2) App ID với đúng bundle id gốc đã có sẵn trên tài khoản?
+    existing = _find_app_id_by_bundle(dev_api, team_id, base_bundle)
+    if existing:
+        print(f"Dùng lại App ID: {team_id}.{base_bundle}")
+        app_id_map[map_key] = {"effective_bundle": base_bundle, "app_id_id": existing}
+        _save_state(state)
+        return base_bundle, existing
+
+    # 3) Tạo mới — tự xử lý 'unavailable' (đổi bundle id) và 'quota' (giải
+    #    phóng App ID cũ) thay vì bỏ cuộc ngay ở lần thử đầu tiên.
+    candidate = base_bundle
+    attempt = 0
+    quota_freed_once = False
+    while True:
+        print(f"Đang tạo App ID: {team_id}.{candidate}")
+        result = dev_api.create_app_id(candidate, app_name)
+        if result:
+            app_id_id = result.get("appIdId") or result.get("id")
+            print(f"✅ Tạo App ID thành công: {team_id}.{candidate}")
+            app_id_map[map_key] = {"effective_bundle": candidate, "app_id_id": app_id_id}
+            _save_state(state)
+            return candidate, app_id_id
+
+        kind = classify_app_id_error(dev_api.last_error)
+        err_msg = (dev_api.last_error or {}).get("userString") or "lỗi không xác định"
+
+        if kind == "unavailable" and attempt < _APP_ID_UNAVAILABLE_MAX_RETRIES:
+            attempt += 1
+            suffix = _random_bundle_suffix()
+            print(
+                f"⚠️  Bundle id '{team_id}.{candidate}' đã bị MỘT TÀI KHOẢN KHÁC đăng ký mất "
+                f"(App ID là duy nhất TOÀN CẦU trên Apple Developer, không chỉ trong tài khoản "
+                f"của bạn) — tự đổi bundle id và thử lại (lần {attempt}/{_APP_ID_UNAVAILABLE_MAX_RETRIES})..."
+            )
+            candidate = f"{base_bundle}-{suffix}"
+            continue
+
+        if kind == "quota" and not quota_freed_once:
+            quota_freed_once = True
+            if _free_one_own_app_id(dev_api, state, skip_map_key=map_key):
+                print("Đã giải phóng 1 App ID cũ do tool này tạo trước đó — thử lại...")
+                continue
+            print(
+                "❌ Tài khoản đã đạt giới hạn 10 App ID mới/7 ngày và không có App ID cũ nào "
+                f"của tool này để tự giải phóng: {err_msg}"
+            )
+            return None, None
+
+        print(f"❌ Không tạo được App ID '{team_id}.{candidate}': {err_msg}")
+        return None, None
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def do_sideload(
@@ -292,32 +430,20 @@ def do_sideload(
         with open(key_file,  "w") as f: f.write(key_pem)
 
         # ── App ID ────────────────────────────────────────────────────────────
-        # BUGFIX v11: list_app_ids() dùng old plist API → trả về list có
-        # "identifier" (bundle ID) và "appIdId" (internal ID) ở top-level,
-        # không có lớp "attributes" như App Store Connect v1.
+        # BUGFIX v13: trước đây, một lỗi 'unavailable' (resultCode 9401 — bundle
+        # id đã bị tài khoản khác đăng ký mất, vd 'com.SideStore.SideStore')
+        # khiến hàm bỏ cuộc ngay lập tức. Giờ dùng _resolve_app_id(), tự động
+        # đổi bundle id (thêm hậu tố) khi bị trùng, và tự giải phóng App ID cũ
+        # khi đạt giới hạn 10 App ID mới/7 ngày — xem chú thích đầy đủ ở định
+        # nghĩa _resolve_app_id() phía trên.
         safe_bundle = bundle_id.replace("_", "-")
-        full_app_id = f"{team_id}.{safe_bundle}"
-        app_ids = dev_api.list_app_ids()
-        existing_id = next(
-            (a for a in app_ids
-             if (a.get("identifier") or a.get("attributes", {}).get("identifier", "")) == full_app_id),
-            None
-        )
-        if existing_id:
-            # Old plist API dùng "appIdId", App Store Connect v1 dùng "id"
-            app_id_id = existing_id.get("appIdId") or existing_id.get("id")
-            print(f"Dùng lại App ID: {full_app_id}")
-        else:
-            print(f"Đang tạo App ID: {full_app_id}")
-            # BUGFIX v11: create_app_id() chỉ nhận (bundle_id, name) —
-            # team_id đã được set_team() đặt vào dev_api.team_id rồi.
-            result = dev_api.create_app_id(safe_bundle, app_name)
-            if not result:
-                err_msg = classify_app_id_error(dev_api.last_error)
-                print(f"❌ Không tạo được App ID: {err_msg}")
-                return False
-            app_id_id = result.get("appIdId") or result.get("id")
-            print(f"✅ Tạo App ID thành công: {full_app_id}")
+        effective_bundle, app_id_id = _resolve_app_id(dev_api, team_id, safe_bundle, app_name, state)
+        if not app_id_id:
+            print("❌ Không tạo được App ID — xem log phía trên để biết nguyên nhân cụ thể.")
+            return False
+        full_app_id = f"{team_id}.{effective_bundle}"
+        if effective_bundle != safe_bundle:
+            print(f"ℹ️  App ID hiệu lực: {full_app_id} (đã đổi từ '{safe_bundle}' do bị trùng).")
 
         # ── Provisioning Profile ──────────────────────────────────────────────
         print("Đang tạo Provisioning Profile...")
@@ -356,8 +482,27 @@ def do_sideload(
             f.write(profile_bytes if isinstance(profile_bytes, bytes) else profile_bytes.encode())
         print("✅ Tải Provisioning Profile thành công.")
 
-        # Đặt bundle ID đã sửa vào app bundle
-        set_bundle_id(app_dir, f"{team_id}.{safe_bundle}")
+        # Đặt bundle ID hiệu lực vào app bundle.
+        #
+        # BUGFIX v13 [CRITICAL — nguyên nhân khiến cài đặt luôn thất bại dù ký
+        # "thành công"]: bản cũ gọi set_bundle_id(app_dir, f"{team_id}.{safe_bundle}")
+        # — TỰ Ý gắn thêm tiền tố Team ID vào CFBundleIdentifier. Đây SAI hoàn
+        # toàn: CFBundleIdentifier trong Info.plist KHÔNG bao giờ chứa Team ID;
+        # Team ID chỉ xuất hiện trong entitlement "application-identifier" của
+        # provisioning profile dưới dạng "TEAMID.<CFBundleIdentifier>" — do
+        # Apple tự ghép, không phải do tool này ghép vào Info.plist.
+        # Hệ quả: App ID đăng ký với Apple là "<team_id>.{effective_bundle}"
+        # (App ID = TeamID + bundle id gốc "com.SideStore.SideStore[-xxxxx]"),
+        # nhưng CFBundleIdentifier bị ghi thành "{team_id}.com.SideStore.SideStore[-xxxxx]"
+        # (có thêm TeamID lặp lại) → khi cài, installd so khớp entitlement
+        # "application-identifier" = "TEAMID.com.SideStore.SideStore..." của
+        # profile với CFBundleIdentifier thực tế của app và thấy KHÔNG khớp
+        # → cài đặt bị từ chối (hoặc app crash ngay khi mở vì code signing
+        # không hợp lệ), dù bước "Ký IPA bằng zsign" ở trên báo "thành công".
+        # Fix: chỉ dùng effective_bundle (bundle id thật, có thể đã thêm hậu
+        # tố ngẫu nhiên nếu bị trùng ở bước _resolve_app_id() — KHÔNG có Team
+        # ID) làm CFBundleIdentifier, đúng như App ID đã đăng ký với Apple.
+        set_bundle_id(app_dir, effective_bundle)
 
         # ── Ký IPA bằng zsign ─────────────────────────────────────────────────
         print("Đang ký IPA bằng zsign...")
