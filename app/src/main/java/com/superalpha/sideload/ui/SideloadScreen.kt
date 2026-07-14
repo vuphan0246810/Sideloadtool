@@ -32,6 +32,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.superalpha.sideload.bridge.NativeLog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.collectAsState
+import com.superalpha.sideload.bridge.NativeBridge
+import com.superalpha.sideload.bridge.UiPrompt
 import com.superalpha.sideload.bridge.UsbPermissionManager
 import com.superalpha.sideload.python.PythonBridge
 import kotlinx.coroutines.launch
@@ -49,6 +55,7 @@ fun SideloadScreen(viewModel: HomeViewModel) {
     val logLines by viewModel.log.collectAsState()
     val usbConnected by viewModel.usbConnected.collectAsState()
     val busy by viewModel.busy.collectAsState()
+    val trustRequired by NativeBridge.trustRequired.collectAsState()
     val savedAppleId by viewModel.savedAppleId.collectAsState()
     val savedAnisetteUrl by viewModel.savedAnisetteUrl.collectAsState()
 
@@ -81,6 +88,22 @@ fun SideloadScreen(viewModel: HomeViewModel) {
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        // Trust banner — hiển thị khi C native cần người dùng bấm Trust trên iPhone
+        if (trustRequired) {
+            androidx.compose.material3.Card(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                colors = androidx.compose.material3.CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer
+                )
+            ) {
+                Text(
+                    text = "⚠️  Bấm \"Tin cậy\" (Trust This Computer) trên màn hình iPhone!",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(12.dp)
+                )
+            }
+        }
         Text("Cài đặt ứng dụng (.ipa) lên iPhone", style = androidx.compose.material3.MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(12.dp))
 

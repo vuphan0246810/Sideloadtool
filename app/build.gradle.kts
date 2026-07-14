@@ -1,7 +1,10 @@
+/*
+ * ĐÃ SỬA: Xoá Chaquopy Python, thêm CMake NDK (libsideloadnative.so),
+ * thêm BouncyCastle cho CertHelper.kt.
+ */
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    id("com.chaquo.python")
 }
 
 android {
@@ -10,90 +13,40 @@ android {
 
     defaultConfig {
         applicationId = "com.superalpha.sideload"
-        // Chaquopy requires minSdk >= 24. USB Host API works from 21+, so 24 is not a
-        // real-world restriction here.
         minSdk = 26
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
-
-        ndk {
-            // The bundled zsign binary (shipped as jniLibs/arm64-v8a/libzsign.so) is only
-            // built for arm64. Restricting the ABI here keeps Chaquopy's own native
-            // download to a single ABI too, which keeps CI build times reasonable.
-            abiFilters += listOf("arm64-v8a")
+        ndk { abiFilters += listOf("arm64-v8a") }
+        externalNativeBuild {
+            cmake { cppFlags(""); arguments("-DANDROID_STL=c++_shared") }
         }
     }
+
+    externalNativeBuild {
+        cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" }
+    }
+
+    ndkVersion = "25.2.9519653"
 
     buildTypes {
-        release {
-            isMinifyEnabled = false
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-        }
-        debug {
-            isDebuggable = true
-        }
+        release { isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro") }
+        debug { isDebuggable = true }
     }
 
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
-    buildFeatures {
-        compose = true
-    }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.14"
-    }
+    compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+    kotlinOptions { jvmTarget = "17" }
+    buildFeatures { compose = true }
+    composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
 
     packaging {
-        resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
-        }
-        // zsign is shipped as a "fake" .so (it is really a standalone ELF executable,
-        // not a shared library) purely so the Android build/packaging system installs
-        // it into the app's native library directory, from which execution is allowed
-        // without root. Prevent the linker/packager from trying to be clever about it.
-        jniLibs {
-            useLegacyPackaging = true
-        }
+        resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+        jniLibs { useLegacyPackaging = true }
     }
 
-    // libzsign.so (built for Termux) dynamically needs libssl.so.3/libcrypto.so.3/
-    // libc++_shared.so at runtime — see AppPaths.nativeDepsDir() for why these can't
-    // live in jniLibs/ like libzsign.so itself (their versioned filenames don't match
-    // the lib*.so pattern the installer extracts into nativeLibraryDir). They are
-    // shipped as plain assets instead and unpacked to filesDir at runtime, so force
-    // them to be stored uncompressed here — avoids relying on AAPT's default
-    // by-extension compression heuristics for an unusual extension like ".3".
     androidResources {
         noCompress += listOf("zsign_deps/libssl.so.3", "zsign_deps/libcrypto.so.3", "zsign_deps/libc++_shared.so")
-    }
-}
-
-chaquopy {
-    defaultConfig {
-        version = "3.11"
-        pip {
-            // requests: HTTP client used by apple_auth.py / developer_api.py.
-            install("requests")
-            // cryptography: AES/PBKDF2/CSR+X.509 generation (Chaquopy ships a prebuilt
-            // Android wheel for this, so no native toolchain is needed at build time).
-            install("cryptography")
-            // srp: SRP-6a client used for the Apple ID GSA/SRP handshake. apple_auth.py
-            // imports the pure-Python `srp._pysrp` submodule directly, so this installs
-            // cleanly even though the package also ships an optional C accelerator.
-            install("srp")
-        }
-    }
-    sourceSets {
-        getByName("main") {
-            srcDir("src/main/python")
-        }
     }
 }
 
@@ -112,6 +65,13 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+
+    // BouncyCastle — dùng bởi CertHelper.kt
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+
+    // OkHttp — dùng cho Apple Developer API calls
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
