@@ -109,6 +109,38 @@ object PythonBridge {
     }
 
     /**
+     * Đăng ký UDID thiết bị iOS vào tài khoản Apple Developer — tách rời khỏi
+     * luồng ký & cài IPA (do_register_device() trong sideload_core.py), chỉ
+     * cần HTTP, không cần USB/IPA đã chọn.
+     */
+    suspend fun registerDevice(
+        appleId: String,
+        password: String,
+        udid: String,
+        deviceName: String,
+        anisetteUrl: String?
+    ): Outcome = withContext(Dispatchers.IO) {
+        try {
+            NativeLog.emit("[python] Đang đăng ký UDID thiết bị...")
+            val core = pythonModule("sideload_core")
+            AppConfig.appleId = appleId
+            val effectiveAnisetteUrl = anisetteUrl?.takeIf { it.isNotBlank() } ?: ""
+            val ok = core.callAttr(
+                "do_register_device",
+                appleId,
+                password,
+                udid,
+                deviceName,
+                effectiveAnisetteUrl
+            ).toBoolean()
+            Outcome(ok, if (ok) "Đăng ký UDID thành công." else "Đăng ký UDID thất bại — xem nhật ký.")
+        } catch (e: Exception) {
+            emitException("[python] ❌ registerDevice lỗi:", e)
+            Outcome(false, e.message?.lines()?.firstOrNull { it.isNotBlank() } ?: e.toString())
+        }
+    }
+
+    /**
      * Danh sách server Anisette công khai — Kotlin OkHttp, không cần Python.
      */
     suspend fun listAnisetteServers(): List<AnisetteServer> = withContext(Dispatchers.IO) {

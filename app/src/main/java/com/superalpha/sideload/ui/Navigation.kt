@@ -5,6 +5,7 @@ import androidx.compose.animation.ExitTransition
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
@@ -23,11 +24,15 @@ import androidx.navigation.compose.rememberNavController
 
 private sealed class Screen(val route: String, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
     object Sideload : Screen("sideload", "Cài IPA", Icons.Filled.CloudUpload)
+    object RegisterDevice : Screen("register_device", "Đăng ký UDID", Icons.Filled.Fingerprint)
     object Revoke : Screen("revoke", "Thu hồi cert", Icons.Filled.PhoneAndroid)
     object Settings : Screen("settings", "Cài đặt", Icons.Filled.Settings)
 }
 
-private val screens = listOf(Screen.Sideload, Screen.Revoke, Screen.Settings)
+// BUGFIX v15 [NEW]: thêm tab "Đăng ký UDID" — trước đây đăng ký UDID chỉ có
+// thể xảy ra ngầm bên trong luồng "Cài IPA" (SideloadScreen), không có cách
+// nào đăng ký UDID độc lập với việc ký/cài một IPA cụ thể.
+private val screens = listOf(Screen.Sideload, Screen.RegisterDevice, Screen.Revoke, Screen.Settings)
 
 @Composable
 fun AppNavHost(viewModel: HomeViewModel) {
@@ -70,6 +75,7 @@ fun AppNavHost(viewModel: HomeViewModel) {
             popExitTransition = { ExitTransition.None }
         ) {
             composable(Screen.Sideload.route) { SideloadScreen(viewModel) }
+            composable(Screen.RegisterDevice.route) { RegisterDeviceScreen(viewModel) }
             composable(Screen.Revoke.route) { RevokeCertsScreen(viewModel) }
             composable(Screen.Settings.route) { SettingsScreen(viewModel) }
         }

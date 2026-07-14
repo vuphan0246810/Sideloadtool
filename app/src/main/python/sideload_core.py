@@ -537,8 +537,23 @@ def do_sideload(
         # đã được AppPaths.nativeDepsDir() tự giải nén sẵn (xem chú thích chi
         # tiết trong AppPaths.kt) — nếu không, linker không tìm thấy 3 thư
         # viện này và zsign thoát ngay với "CANNOT LINK EXECUTABLE".
+        #
+        # BUGFIX v15 [CRITICAL]: sau khi v14 làm zsign thực sự chạy được, nó
+        # thoát ngay với "Invalid temp folder! /tmp" (exit 255). Nguyên nhân:
+        # zsign (src/zsign.cpp, hàm main) mặc định dùng ZFile::GetTempFolder()
+        # làm nơi giải nén IPA tạm thời và ghi ipa output tạm — trên
+        # Linux/Android hàm này trả cứng "/tmp" (src/common/fs.cpp) nếu không
+        # truyền cờ -t/--temp_folder. Android sandbox của mỗi app KHÔNG có
+        # thư mục /tmp nào cả (mỗi app chỉ thấy filesDir riêng của mình), nên
+        # zsign tự kiểm tra IsFolder("/tmp") thất bại và thoát ngay trước khi
+        # kịp đọc bất kỳ tham số ký nào khác. zsign CÓ hỗ trợ chỉ định thư mục
+        # tạm qua "-t <path>" — chỉ cần trỏ vào một thư mục ghi được bên trong
+        # sideload_work (đã tồn tại, đã ghi được vì cert.pem/key.pem ở trên
+        # cũng nằm trong đó) là đủ.
         print("Đang ký IPA bằng zsign...")
         signed_ipa = os.path.join(work_dir, "signed.ipa")
+        zsign_tmp_dir = os.path.join(work_dir, "zsign_tmp")
+        os.makedirs(zsign_tmp_dir, exist_ok=True)
         zsign_bin = AppPaths.zsignPath()
         zsign_env = {"LD_LIBRARY_PATH": AppPaths.nativeDepsDir()}
         # BUGFIX v12: run_command() trả về str (stdout) hoặc raise CalledProcessError,
@@ -552,6 +567,7 @@ def do_sideload(
                 "-m", profile_file,
                 "-o", signed_ipa,
                 "-z", "9",
+                "-t", zsign_tmp_dir,
                 ipa_path,
             ], extra_env=zsign_env)
             print("✅ Ký IPA thành công.")
@@ -581,6 +597,77 @@ def do_sideload(
         import traceback
         print(f"❌ Lỗi không mong đợi trong do_sideload: {e}")
         traceback.print_exc()   # → sys.stderr → _StderrBridge → NativeLog UI
+        return False
+
+
+def do_register_device(
+    apple_id: str,
+    password: str,
+    udid: str,
+    device_name: str = "iPhone (Android Sideload)",
+    anisette_url: str = "",
+) -> bool:
+    """
+    Đăng ký UDID thiết bị iOS vào tài khoản Apple Developer, tách rời khỏi
+    luồng ký & cài IPA.
+    BUGFIX v15 [NEW]: trước đây việc đăng ký UDID chỉ xảy ra ngầm bên trong
+    do_sideload() (phải có sẵn file IPA + kết nối USB mới đăng ký được, và
+    lỗi đăng ký chỉ lộ ra sau khi đã đăng nhập + giải nén IPA). Hàm này cho
+    phép đăng ký UDID độc lập — hữu ích khi muốn thêm thiết bị vào team
+    trước, hoặc đăng ký một UDID không phải thiết bị đang cắm USB ngay lúc
+    đó (vd lấy UDID từ Cài đặt > Chung > Giới thiệu trên iPhone rồi nhập tay).
+    Dùng lại đúng logic chống trùng lặp (list_devices trước khi add) và kiểm
+    tra lỗi (last_error) như trong do_sideload(), không tự ý bỏ qua bước nào.
+    """
+    try:
+        print("══ Bắt đầu đăng ký UDID thiết bị ══")
+        udid = (udid or "").strip()
+        if not udid:
+            print("❌ Chưa có UDID để đăng ký — kết nối USB hoặc nhập UDID tay.")
+            return False
+
+        print("Đang đăng nhập Apple ID...")
+        effective_anisette = anisette_url or config_manager.get_anisette_url()
+        auth = AppleAuth(anisette_url=effective_anisette or None)
+        session = auth.authenticate(apple_id, password)
+        if not session or not session.get("authenticated"):
+            print("❌ Đăng nhập Apple ID thất bại.")
+            return False
+        print("✅ Đăng nhập thành công.")
+
+        dev_api = DeveloperAPI(auth, session["dsid"], session["session_token"])
+        teams = dev_api.list_teams()
+        if not teams:
+            print("❌ Không lấy được Development Team.")
+            return False
+        team_id = teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id")
+        dev_api.set_team(team_id)
+        print(f"Team: {team_id}")
+
+        devices = dev_api.list_devices()
+        existing = next(
+            (d for d in devices
+             if (d.get("deviceNumber") or d.get("attributes", {}).get("udid", "")) == udid),
+            None,
+        )
+        if existing:
+            name = existing.get("name") or existing.get("attributes", {}).get("name", "?")
+            print(f"ℹ️  UDID {udid} đã được đăng ký sẵn trên team này (tên: {name}) — không cần đăng ký lại.")
+            return True
+
+        print(f"Đang đăng ký thiết bị UDID: {udid} (tên: {device_name})")
+        if not dev_api.register_device(device_name, udid):
+            err_msg = (dev_api.last_error or {}).get("userString") or "lỗi không xác định"
+            print(f"❌ Không đăng ký được thiết bị UDID {udid}: {err_msg}")
+            return False
+
+        print(f"✅ Đăng ký thiết bị thành công: {udid}")
+        return True
+
+    except Exception as e:
+        import traceback
+        print(f"❌ Lỗi không mong đợi trong do_register_device: {e}")
+        traceback.print_exc()
         return False
 
 
