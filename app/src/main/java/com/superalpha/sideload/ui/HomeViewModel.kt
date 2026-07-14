@@ -7,12 +7,17 @@ import com.superalpha.sideload.bridge.AppConfig
 import com.superalpha.sideload.bridge.NativeBridge
 import com.superalpha.sideload.bridge.NativeLog
 import com.superalpha.sideload.bridge.UsbTransport
+import com.superalpha.sideload.python.PythonBridge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
- * ĐÃ SỬA: Dùng NativeBridge (C JNI) + AppConfig thay vì PythonBridge.
+ * ĐÃ SỬA: Dùng NativeBridge (C JNI) + AppConfig thay vì PythonBridge cho phần
+ * kết nối/sideload trực tiếp qua USB. Danh sách server Anisette (dùng ở
+ * SettingsScreen) vẫn lấy qua PythonBridge.listAnisetteServers() — hàm đó giờ
+ * gọi thẳng OkHttp tới servers.sidestore.io thay vì Python, và được load một
+ * lần rồi cache ở đây để chuyển qua lại tab Cài đặt không phải tải lại mạng.
  */
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
     val nativeBridge = NativeBridge(app)
@@ -27,7 +32,11 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private val _savedAnisetteUrl = MutableStateFlow(AppConfig.anisetteUrl)
     val savedAnisetteUrl: StateFlow<String> = _savedAnisetteUrl
 
-    val anisetteServers = AppConfig.defaultAnisetteServers
+    private val _anisetteServers = MutableStateFlow<List<PythonBridge.AnisetteServer>>(emptyList())
+    val anisetteServers: StateFlow<List<PythonBridge.AnisetteServer>> = _anisetteServers
+    private val _anisetteServersLoading = MutableStateFlow(false)
+    val anisetteServersLoading: StateFlow<Boolean> = _anisetteServersLoading
+
     val trustRequired = NativeBridge.trustRequired
 
     init {
@@ -47,6 +56,22 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     fun saveAppleId(v: String) { _savedAppleId.value = v; AppConfig.appleId = v }
     fun saveAnisetteUrl(v: String) { _savedAnisetteUrl.value = v; AppConfig.anisetteUrl = v }
     fun dismissTrust() = NativeBridge.dismissTrust()
+
+    /** Tải danh sách server Anisette công khai một lần rồi cache lại; gọi
+     * [reloadAnisetteServers] để buộc tải lại. Gọi an toàn ở mỗi lần
+     * SettingsScreen recompose — không làm gì nếu đã có danh sách. */
+    fun loadAnisetteServersIfNeeded() {
+        if (_anisetteServers.value.isNotEmpty() || _anisetteServersLoading.value) return
+        reloadAnisetteServers()
+    }
+
+    fun reloadAnisetteServers() {
+        _anisetteServersLoading.value = true
+        viewModelScope.launch {
+            _anisetteServers.value = PythonBridge.listAnisetteServers()
+            _anisetteServersLoading.value = false
+        }
+    }
 
     fun onUsbReady() {
         if (_busy.value) return

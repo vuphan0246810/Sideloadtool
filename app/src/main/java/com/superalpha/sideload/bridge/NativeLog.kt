@@ -14,6 +14,9 @@ object NativeLog {
         _lines.tryEmit(line)
     }
 
+    /** Ghi một dòng log đơn giản (không có tag) — dùng bởi UI/Activity. */
+    fun log(message: String) = emit(message)
+
     @JvmStatic
     fun log(tag: String, message: String) = emit("[$tag] $message")
 }

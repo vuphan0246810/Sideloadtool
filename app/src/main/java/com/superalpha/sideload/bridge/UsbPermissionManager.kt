@@ -8,7 +8,6 @@ import android.content.IntentFilter
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
-import com.chaquo.python.Python
 import java.util.concurrent.Executors
 
 /**
@@ -40,8 +39,8 @@ object UsbPermissionManager {
 
     /**
      * Publishes the connected device's USB serial number (== UDID for essentially every
-     * iPhone/iPad) into sideload_core.py's cache, so device_link.get_udid_from_usb()
-     * never has to round-trip lockdownd just to answer "which device is this". Reading
+     * iPhone/iPad) into [AppConfig.lastUdid], so the rest of the app never has to
+     * round-trip lockdownd/native just to answer "which device is this". Reading
      * UsbDevice.getSerialNumber() this way (right after our own requestPermission grant)
      * does not need any extra Android runtime permission beyond the USB device grant
      * itself, per the platform's USB Host API contract.
@@ -54,10 +53,10 @@ object UsbPermissionManager {
         }
         if (!serial.isNullOrBlank()) {
             try {
-                Python.getInstance().getModule("sideload_core").callAttr("set_current_udid", serial)
+                AppConfig.lastUdid = serial
             } catch (_: Exception) {
-                // Chaquopy Python may not be started yet the very first time; harmless,
-                // the UDID will just need to be looked up again on next attempt.
+                // AppConfig.init() chưa được gọi (không nên xảy ra vì SuperAlphaApp.onCreate()
+                // luôn gọi trước khi bất kỳ luồng USB nào có thể chạy); bỏ qua an toàn.
             }
         }
     }
@@ -105,7 +104,7 @@ object UsbPermissionManager {
 
         if (usbManager.hasPermission(device)) {
             ioExecutor.execute {
-                val ok = UsbTransport.open(usbManager, device)
+                val ok = UsbTransport.open(device, usbManager)
                 if (ok) publishUdid(device)
                 finish(ok, if (ok) "Đã kết nối USB." else openFailureMessage())
             }
@@ -151,7 +150,7 @@ object UsbPermissionManager {
                     return
                 }
                 ioExecutor.execute {
-                    val ok = UsbTransport.open(usbManager, grantedDevice)
+                    val ok = UsbTransport.open(grantedDevice, usbManager)
                     if (ok) publishUdid(grantedDevice)
                     finish(ok, if (ok) "Đã kết nối USB." else openFailureMessage())
                 }
